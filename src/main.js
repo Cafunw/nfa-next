@@ -23,9 +23,12 @@ const state = {
   filter: "all",
   sort: store.get("sort") || "smart",
   switching: false,
+  avatars: {},
+  update: null,
 };
 
 // ---------- helpers ----------
+const now = () => Math.floor(Date.now() / 1000);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nameOf = (a) => a.nickname || a.persona || a.account_name;
 const initials = (a) => {
@@ -34,15 +37,25 @@ const initials = (a) => {
   return ((parts[0]?.[0] || "?") + (parts[1]?.[0] || parts[0]?.[1] || "")).toLocaleUpperCase(locale());
 };
 const isActive = (a) => a.account_name && a.account_name.toLowerCase() === (state.status.active_user || "").toLowerCase();
+const onCooldown = (a) => a.cooldown_until > now();
+const isBanned = (a) => a.vac_banned || (a.trade_ban && a.trade_ban !== "None");
+const onlineLookups = () => store.get("onlineLookups") !== "0";
 const fmtDate = (ts) => new Date(ts * 1000).toLocaleDateString(locale());
 function ago(ts) {
   if (!ts) return t("never");
-  const s = Math.floor(Date.now() / 1000) - ts;
+  const s = now() - ts;
   if (s < 60) return t("justNow");
   if (s < 3600) return t("minAgo", { n: Math.floor(s / 60) });
   if (s < 86400) return t("hourAgo", { n: Math.floor(s / 3600) });
   if (s < 86400 * 30) return t("dayAgo", { n: Math.floor(s / 86400) });
   return fmtDate(ts);
+}
+function fmtLeft(sec) {
+  if (sec <= 0) return t("cdDone");
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (d > 0) return t("cdDays", { d, h });
+  const p = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
 }
 const ICON = {
   star: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9z"/></svg>',
@@ -54,6 +67,11 @@ const ICON = {
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
   link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3l18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.4 5.2A9.7 9.7 0 0 1 12 5c5 0 9 5 10 7a17 17 0 0 1-3.2 4M6.2 6.2C4 7.7 2.6 10 2 12c1 2 5 7 10 7a9.6 9.6 0 0 0 5.8-1.8"/></svg>',
+  plane: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.6a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M2 9a15 15 0 0 1 20 0M12 20h.01"/><path d="M3 3l18 18"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
 };
 
@@ -75,6 +93,9 @@ async function loadAccounts() {
   try { state.accounts = await invoke("list_accounts"); } catch (e) { toast(String(e), "err"); }
   render();
 }
+async function loadAvatars() {
+  try { state.avatars = await invoke("get_avatars"); render(); } catch (_) { /* letters stay */ }
+}
 async function capture(silent = false) {
   try {
     const before = state.accounts.length;
@@ -82,6 +103,7 @@ async function capture(silent = false) {
     const added = state.accounts.length - before;
     if (!silent) toast(added > 0 ? t("capturedN", { n: added }) : t("capturedNone"), added > 0 ? "ok" : "info");
     render();
+    if (added > 0) { loadAvatars(); refreshProfiles(); }
   } catch (e) { if (!silent) toast(String(e), "err"); }
 }
 async function update(steamid, patch) {
@@ -90,6 +112,39 @@ async function update(steamid, patch) {
     Object.assign(state.accounts.find((a) => a.steamid === steamid) || {}, patch);
     render();
   } catch (e) { toast(String(e), "err"); }
+}
+let refreshing = false;
+async function refreshProfiles(force = false) {
+  if (!onlineLookups() || !state.accounts.length || refreshing) return;
+  refreshing = true;
+  try {
+    state.accounts = await invoke("refresh_profiles", { force });
+    await loadAvatars();
+    if (force) toast(t("profilesRefreshed"));
+  } catch (e) { if (force) toast(String(e), "err"); }
+  refreshing = false;
+}
+
+// ---------- updates ----------
+async function checkUpdate(manual = false) {
+  try {
+    state.update = await invoke("check_update");
+    if (state.update) showUpdateBar();
+    else if (manual) toast(t("upToDate"), "info");
+  } catch (e) { if (manual) toast(t("updateCheckFail", { e: String(e) }), "err"); }
+}
+function showUpdateBar() {
+  const bar = $("#updateBar");
+  bar.innerHTML = `<span class="upd-ic">${ICON.bolt}</span><span class="upd-text">${esc(t("updateAvailable", { v: state.update.version }))}</span>
+    <button class="btn primary sm" id="updGo">${esc(t("updateNow"))}</button>
+    <button class="upd-x" id="updX" title="${esc(t("close"))}">${ICON.x}</button>`;
+  bar.hidden = false;
+  $("#updX").onclick = () => (bar.hidden = true);
+  $("#updGo").onclick = async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true; b.textContent = t("updating");
+    try { await invoke("install_update"); } catch (err) { toast(String(err), "err"); b.disabled = false; b.textContent = t("updateNow"); }
+  };
 }
 
 // ---------- rendering ----------
@@ -113,16 +168,18 @@ function visibleAccounts() {
   const q = state.query.trim().toLocaleLowerCase(locale());
   const list = state.accounts.filter((a) => {
     if (state.filter === "fav" && !a.favorite) return false;
+    if (state.filter === "cd" && !onCooldown(a)) return false;
+    if (state.filter === "ban" && !isBanned(a)) return false;
     if (state.filter.startsWith("tag:") && !a.tags.includes(state.filter.slice(4))) return false;
     if (!q) return true;
-    return [a.nickname, a.persona, a.account_name, a.steamid, a.note, ...a.tags].join(" ").toLocaleLowerCase(locale()).includes(q);
+    return [a.nickname, a.persona, a.account_name, a.steamid, a.note, a.cooldown_reason, ...a.tags].join(" ").toLocaleLowerCase(locale()).includes(q);
   });
   const cmp = (x, y) => nameOf(x).localeCompare(nameOf(y), locale());
   const by = {
     name: cmp,
     recent: (x, y) => y.last_switch - x.last_switch,
     login: (x, y) => y.timestamp - x.timestamp,
-    smart: (x, y) => (isActive(y) - isActive(x)) || (y.favorite - x.favorite) || (y.last_switch - x.last_switch) || cmp(x, y),
+    smart: (x, y) => (isActive(y) - isActive(x)) || (y.favorite - x.favorite) || (onCooldown(x) - onCooldown(y)) || (y.last_switch - x.last_switch) || cmp(x, y),
   }[state.sort] || cmp;
   return list.sort(by);
 }
@@ -131,21 +188,48 @@ function renderChips() {
   const tags = {};
   state.accounts.forEach((a) => a.tags.forEach((tg) => (tags[tg] = (tags[tg] || 0) + 1)));
   const favs = state.accounts.filter((a) => a.favorite).length;
+  const cds = state.accounts.filter(onCooldown).length, bans = state.accounts.filter(isBanned).length;
   const chips = [["all", t("chipAll"), state.accounts.length], ["fav", t("chipFav"), favs],
+    ...(cds ? [["cd", t("chipCd"), cds]] : []), ...(bans ? [["ban", t("chipBan"), bans]] : []),
     ...Object.entries(tags).sort().map(([tg, n]) => [`tag:${tg}`, tg, n])];
   if (!chips.some(([k]) => k === state.filter)) state.filter = "all";
   $("#chips").innerHTML = chips.map(([k, label, n]) =>
     `<button class="chip ${state.filter === k ? "active" : ""}" data-filter="${esc(k)}">${esc(label)}<span class="n">${n}</span></button>`).join("");
 }
 
+function avatarHTML(a, extra = "") {
+  const img = state.avatars[a.steamid];
+  const inner = img ? `<img src="${esc(img)}" alt="" draggable="false"/>` : esc(initials(a));
+  return `<div class="avatar ${img ? "has-img" : ""}" style="--c:${esc(a.color || "#10b981")}">${inner}${extra}</div>`;
+}
+
+function badgesHTML(a) {
+  const b = [];
+  if (a.vac_banned) b.push(`<span class="badge bad" title="${esc(t("vacTitle"))}">${ICON.shield} VAC</span>`);
+  if (a.trade_ban && a.trade_ban !== "None") b.push(`<span class="badge bad" title="${esc(t("tradeTitle", { s: a.trade_ban }))}">${esc(t("tradeBan"))}</span>`);
+  if (a.limited) b.push(`<span class="badge warn" title="${esc(t("limitedTitle"))}">${esc(t("limited"))}</span>`);
+  if (a.privacy && a.privacy !== "public") b.push(`<span class="badge dim" title="${esc(t("privacyTitle", { s: a.privacy }))}">${esc(t("private"))}</span>`);
+  if (a.profile_checked && a.profile_found && !b.length) b.push(`<span class="badge ok" title="${esc(t("cleanTitle", { d: ago(a.profile_checked) }))}">${ICON.shield} ${esc(t("clean"))}</span>`);
+  if (a.login_mode === "invisible") b.push(`<span class="badge mode" title="${esc(t("modeInvisibleSub"))}">${ICON.eye} ${esc(t("modeInvisible"))}</span>`);
+  if (a.login_mode === "offline") b.push(`<span class="badge mode" title="${esc(t("modeOfflineSub"))}">${ICON.plane} ${esc(t("modeOffline"))}</span>`);
+  return b.length ? `<div class="badges">${b.join("")}</div>` : "";
+}
+
+function cooldownHTML(a) {
+  if (!onCooldown(a)) return "";
+  const until = new Date(a.cooldown_until * 1000).toLocaleString(locale());
+  return `<div class="cooldown" title="${esc(t("cdUntil", { d: until }))}">
+    ${ICON.clock}<span class="cd-reason">${esc(a.cooldown_reason || t("cooldown"))}</span><b class="cd" data-until="${a.cooldown_until}">${esc(fmtLeft(a.cooldown_until - now()))}</b></div>`;
+}
+
 function cardHTML(a, i) {
   const active = isActive(a);
   const tags = a.tags.map((tg) => `<span class="tag" style="--tc:${TAG_COLORS[tg] || esc(a.color)}">${esc(tg)}</span>`).join("");
   return `
-  <article class="card ${active ? "active" : ""}" data-id="${esc(a.steamid)}" tabindex="0" style="--c:${esc(a.color || "#10b981")};animation-delay:${Math.min(i, 12) * 30}ms">
+  <article class="card ${active ? "active" : ""} ${onCooldown(a) ? "on-cd" : ""}" data-id="${esc(a.steamid)}" tabindex="0" style="--c:${esc(a.color || "#10b981")};animation-delay:${Math.min(i, 12) * 30}ms">
     ${i < 9 ? `<span class="quick">${i + 1}</span>` : ""}
     <div class="card-top">
-      <div class="avatar">${esc(initials(a))}${active ? '<span class="online"></span>' : ""}</div>
+      ${avatarHTML(a, active ? '<span class="online"></span>' : "")}
       <div class="who">
         <div class="name" title="${esc(nameOf(a))}">${esc(nameOf(a))}</div>
         <div class="login">@${esc(a.account_name)}</div>
@@ -153,10 +237,12 @@ function cardHTML(a, i) {
       <button class="star ${a.favorite ? "on" : ""}" data-act="fav" title="${esc(t("favorite"))}">${ICON.star}</button>
       <button class="more" data-act="menu" title="${esc(t("more"))}">${ICON.more}</button>
     </div>
+    ${badgesHTML(a)}
     <div class="meta">
       <div class="copy" data-act="copy" title="${esc(t("copyTitle"))}"><small>SteamID64</small><span>${esc(a.steamid)}</span></div>
       <div><small>${esc(t("lastSwitch"))}</small><span>${esc(ago(a.last_switch))}</span></div>
     </div>
+    ${cooldownHTML(a)}
     ${a.note ? `<div class="note">${esc(a.note)}</div>` : ""}
     ${tags ? `<div class="tags">${tags}</div>` : ""}
     <div class="card-bottom">
@@ -179,14 +265,15 @@ function render() {
 }
 
 // ---------- switching ----------
-async function switchTo(steamid) {
+async function switchTo(steamid, mode) {
   const a = state.accounts.find((x) => x.steamid === steamid);
   if (!a || state.switching) return;
   if (!state.status.steam_found) return toast(t("steamNotFoundErr"), "err");
   state.switching = true;
   const ov = $("#switchOverlay"), steps = [...document.querySelectorAll("#switchSteps li")];
-  $("#switchAvatar").innerHTML = `<div class="avatar" style="--c:${esc(a.color)}">${esc(initials(a))}</div>`;
-  $("#switchTitle").textContent = t("switchingTo", { name: nameOf(a) });
+  const m = mode ?? a.login_mode;
+  $("#switchAvatar").innerHTML = avatarHTML(a);
+  $("#switchTitle").textContent = t(m === "invisible" ? "switchingInvisible" : m === "offline" ? "switchingOffline" : "switchingTo", { name: nameOf(a) });
   steps.forEach((s) => (s.className = ""));
   ov.hidden = false;
 
@@ -196,14 +283,15 @@ async function switchTo(steamid) {
   // backend does it all in one call; advance the visual steps while it runs
   const timer = setInterval(() => { if (step < 1) mark(++step); }, 2200);
   try {
-    await invoke("switch_account", { steamid });
+    await invoke("switch_account", { steamid, mode: mode ?? null });
     clearInterval(timer);
     mark(2);
     await new Promise((r) => setTimeout(r, 700));
     mark(3);
-    a.last_switch = Math.floor(Date.now() / 1000);
+    a.last_switch = now();
     state.status.active_user = a.account_name;
     toast(t("switched", { name: nameOf(a) }), "ok");
+    if (onCooldown(a)) toast(t("cdStill", { left: fmtLeft(a.cooldown_until - now()) }), "info");
     await new Promise((r) => setTimeout(r, 350));
   } catch (e) {
     clearInterval(timer);
@@ -221,14 +309,17 @@ function openModal(html, onMount) {
   $("#modal").innerHTML = html;
   $("#modalBackdrop").hidden = false;
   onMount?.($("#modal"));
-  setTimeout(() => $("#modal").querySelector("input:not([type=checkbox]),textarea")?.focus(), 30);
+  setTimeout(() => $("#modal").querySelector("input:not([type=checkbox]):not([type=datetime-local]),textarea")?.focus(), 30);
 }
 const closeModal = () => { $("#modalBackdrop").hidden = true; $("#modal").innerHTML = ""; };
 
 function editModal(a) {
   let color = a.color;
+  let mode = a.login_mode || "";
   const tags = new Set(a.tags);
   const allTags = [...new Set([...Object.keys(TAG_COLORS), ...state.accounts.flatMap((x) => x.tags)])];
+  const modes = [["", "modeNormal"], ["invisible", "modeInvisible"], ["offline", "modeOffline"]];
+  const presets = [[1800, "cd30m"], [7200, "cd2h"], [86400, "cd1d"], [604800, "cd7d"]];
   openModal(`
     <h2>${esc(t("editTitle"))}</h2>
     <p class="sub">@${esc(a.account_name)} · ${esc(a.steamid)}</p>
@@ -238,6 +329,12 @@ function editModal(a) {
       <div class="tag-picker" id="fTags">${allTags.map((tg) => `<span class="tag ${tags.has(tg) ? "on" : ""}" data-t="${esc(tg)}" style="--tc:${TAG_COLORS[tg] || "#8b96a5"}">${esc(tg)}</span>`).join("")}</div>
       <input id="fNewTag" maxlength="16" placeholder="${esc(t("newTagPh"))}" style="margin-top:6px"/>
     </div>
+    <div class="field"><label>${esc(t("loginMode"))}</label>
+      <div class="seg wide" id="fMode">${modes.map(([k, l]) => `<button class="${mode === k ? "on" : ""}" data-m="${k}">${esc(t(l))}</button>`).join("")}</div>
+      <span class="hint" id="fModeHint"></span></div>
+    <div class="field"><label>${esc(t("cooldown"))}</label>
+      <div class="cd-presets" id="fCdPresets">${presets.map(([s, l]) => `<button class="chip" data-s="${s}">${esc(t(l))}</button>`).join("")}<button class="chip" data-s="0">${esc(t("cdClear"))}</button></div>
+      <div class="row"><input id="fCdUntil" type="datetime-local"/><input id="fCdReason" maxlength="40" placeholder="${esc(t("cdReasonPh"))}" value="${esc(a.cooldown_reason)}"/></div></div>
     <div class="field"><label>${esc(t("color"))}</label><div class="swatches" id="fColors">${PALETTE.map((c) => `<button class="swatch ${c === color ? "sel" : ""}" data-c="${c}" style="--c:${c}"></button>`).join("")}</div></div>
     <div class="modal-actions"><button class="btn ghost" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="fSave">${esc(t("save"))}</button></div>`,
   (m) => {
@@ -256,8 +353,32 @@ function editModal(a) {
       const s = e.target.closest(".swatch"); if (!s) return;
       color = s.dataset.c; m.querySelectorAll(".swatch").forEach((x) => x.classList.toggle("sel", x === s));
     };
+    const hint = m.querySelector("#fModeHint");
+    const setHint = () => (hint.textContent = t(mode === "invisible" ? "modeInvisibleSub" : mode === "offline" ? "modeOfflineSub" : "modeNormalSub"));
+    setHint();
+    m.querySelector("#fMode").onclick = (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      mode = b.dataset.m;
+      m.querySelectorAll("#fMode button").forEach((x) => x.classList.toggle("on", x === b));
+      setHint();
+    };
+    const cdInput = m.querySelector("#fCdUntil"), cdReason = m.querySelector("#fCdReason");
+    const toLocal = (ts) => { const d = new Date(ts * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+    if (onCooldown(a)) cdInput.value = toLocal(a.cooldown_until);
+    m.querySelector("#fCdPresets").onclick = (e) => {
+      const b = e.target.closest("[data-s]"); if (!b) return;
+      const secs = +b.dataset.s;
+      cdInput.value = secs ? toLocal(now() + secs) : "";
+      if (!secs) cdReason.value = "";
+    };
     m.querySelector("#fSave").onclick = async () => {
-      await update(a.steamid, { nickname: m.querySelector("#fNick").value.trim(), note: m.querySelector("#fNote").value.trim(), tags: [...tags], color });
+      const until = cdInput.value ? Math.floor(new Date(cdInput.value).getTime() / 1000) : 0;
+      const live = until > now();
+      await update(a.steamid, {
+        nickname: m.querySelector("#fNick").value.trim(), note: m.querySelector("#fNote").value.trim(), tags: [...tags], color,
+        login_mode: mode, cooldown_until: live ? until : 0, cooldown_reason: live ? cdReason.value.trim() : "",
+      });
+      a._cdToasted = false;
       closeModal(); toast(t("saved"));
     };
   });
@@ -274,6 +395,7 @@ function tokenModal() {
       <div class="field"><label>${esc(t("personaOpt"))}</label><input id="tPersona" placeholder="${esc(t("personaPh"))}"/></div>
     </div>
     <div class="callout">${t("tokenWarn")}</div>
+    <p class="fine">${ICON.shield} ${esc(t("tokenEncrypted"))}</p>
     <div class="modal-actions"><button class="btn ghost" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="tAdd">${esc(t("add"))}</button></div>`,
   (m) => {
     const tok = m.querySelector("#tTok"), prev = m.querySelector("#tPrev");
@@ -290,7 +412,7 @@ function tokenModal() {
       e.target.disabled = true;
       try {
         await invoke("add_account_token", { token: tok.value, accountName: m.querySelector("#tName").value, persona: m.querySelector("#tPersona").value });
-        closeModal(); toast(t("added")); loadAccounts();
+        closeModal(); toast(t("added")); await loadAccounts(); refreshProfiles();
       } catch (err) { toast(String(err), "err"); e.target.disabled = false; }
     };
   });
@@ -319,27 +441,47 @@ function removeModal(a) {
 
 function settingsModal() {
   const s = state.status;
+  const row = (title, sub, ctrl, subId = "") => `<div class="set-row"><div><b>${esc(t(title))}</b><small ${subId ? `id="${subId}"` : ""}>${esc(t(sub))}</small></div><div class="set-ctrl">${ctrl}</div></div>`;
+  const toggle = (id, on) => `<input type="checkbox" id="${id}" class="toggle" ${on ? "checked" : ""}/>`;
   openModal(`
     <h2>${esc(t("settings"))}</h2>
     <p class="sub">${s.steam_found ? esc(t("steamAt", { p: s.steam_path })) : esc(t("steamMissing"))}</p>
-    <div style="margin-top:10px">
-      <div class="set-row"><div><b>${esc(t("language"))}</b><small>${esc(t("languageSub"))}</small></div>
-        <div class="seg" id="sLang">${Object.entries(LANGS).map(([k, label]) => `<button class="${k === LANG ? "on" : ""}" data-l="${k}">${label}</button>`).join("")}</div></div>
-      <div class="set-row"><div><b>${esc(t("startSteam"))}</b><small>${esc(t("startSteamSub"))}</small></div><button class="btn ghost" id="sOpen">${esc(t("start"))}</button></div>
-      <div class="set-row"><div><b>${esc(t("stopSteam"))}</b><small>${esc(t("stopSteamSub"))}</small></div><button class="btn ghost" id="sStop">${esc(t("stop"))}</button></div>
-      <div class="set-row"><div><b>${esc(t("autoCapture"))}</b><small>${esc(t("autoCaptureSub"))}</small></div><input type="checkbox" id="sAuto" style="accent-color:var(--accent);width:18px;height:18px" ${store.get("autoCapture") !== "0" ? "checked" : ""}/></div>
-      <div class="set-row"><div><b>${esc(t("clearAll"))}</b><small>${esc(t("clearAllSub"))}</small></div><button class="btn danger" id="sClear">${esc(t("clear"))}</button></div>
+    <div style="margin-top:6px">
+      ${row("language", "languageSub", `<div class="seg" id="sLang">${Object.entries(LANGS).map(([k, label]) => `<button class="${k === LANG ? "on" : ""}" data-l="${k}">${label}</button>`).join("")}</div>`)}
+      ${row("onlineLookups", "onlineLookupsSub", `<button class="btn ghost" id="sRefresh">${ICON.refresh} ${esc(t("refreshNow"))}</button>${toggle("sOnline", onlineLookups())}`)}
+      ${row("backup", "backupSub", `<button class="btn ghost" id="sExport">${esc(t("export"))}</button><button class="btn ghost" id="sImport">${esc(t("import"))}</button>`)}
+      ${row("updates", "updatesSub", `<button class="btn ghost" id="sUpd">${esc(t("checkNow"))}</button>${toggle("sAutoUpd", store.get("autoUpdate") !== "0")}`, "sVer")}
+      ${row("autoCapture", "autoCaptureSub", toggle("sAuto", store.get("autoCapture") !== "0"))}
+      ${row("startSteam", "startSteamSub", `<button class="btn ghost" id="sOpen">${esc(t("start"))}</button>`)}
+      ${row("stopSteam", "stopSteamSub", `<button class="btn ghost" id="sStop">${esc(t("stop"))}</button>`)}
+      ${row("clearAll", "clearAllSub", `<button class="btn danger" id="sClear">${esc(t("clear"))}</button>`)}
     </div>
     <div class="modal-actions"><button class="btn ghost" data-close>${esc(t("closeBtn"))}</button></div>`,
   (m) => {
+    const busy = async (btn, fn) => { btn.disabled = true; try { await fn(); } finally { btn.disabled = false; } };
     m.querySelector("#sLang").onclick = (e) => {
       const l = e.target.closest("button")?.dataset.l;
       if (!l || l === LANG) return;
       setLang(l); render(); settingsModal(); // re-open so the modal itself is translated
     };
-    m.querySelector("#sOpen").onclick = async () => { try { await invoke("open_steam"); toast(t("steamStarting")); setTimeout(refreshStatus, 2500); } catch (e) { toast(String(e), "err"); } };
-    m.querySelector("#sStop").onclick = async (e) => { e.target.disabled = true; try { await invoke("stop_steam_cmd"); toast(t("steamStopped")); refreshStatus(); } catch (err) { toast(String(err), "err"); } e.target.disabled = false; };
+    T.app.getVersion().then((v) => (m.querySelector("#sVer").textContent = t("versionIs", { v }))).catch(() => {});
+    m.querySelector("#sOnline").onchange = (e) => { store.set("onlineLookups", e.target.checked ? "1" : "0"); if (e.target.checked) refreshProfiles(); };
+    m.querySelector("#sRefresh").onclick = (e) => onlineLookups() ? busy(e.currentTarget, () => refreshProfiles(true)) : toast(t("lookupsOff"), "info");
+    m.querySelector("#sExport").onclick = async () => {
+      try { if (await invoke("export_backup")) toast(t("exported")); } catch (e) { toast(String(e), "err"); }
+    };
+    m.querySelector("#sImport").onclick = async () => {
+      try {
+        const r = await invoke("import_backup"); if (!r) return;
+        state.accounts = r.accounts; render(); loadAvatars();
+        toast(t("imported", { a: r.added, u: r.updated }));
+      } catch (e) { toast(String(e), "err"); }
+    };
+    m.querySelector("#sUpd").onclick = (e) => busy(e.currentTarget, () => checkUpdate(true));
+    m.querySelector("#sAutoUpd").onchange = (e) => store.set("autoUpdate", e.target.checked ? "1" : "0");
     m.querySelector("#sAuto").onchange = (e) => store.set("autoCapture", e.target.checked ? "1" : "0");
+    m.querySelector("#sOpen").onclick = async () => { try { await invoke("open_steam"); toast(t("steamStarting")); setTimeout(refreshStatus, 2500); } catch (e) { toast(String(e), "err"); } };
+    m.querySelector("#sStop").onclick = (e) => busy(e.currentTarget, async () => { try { await invoke("stop_steam_cmd"); toast(t("steamStopped")); refreshStatus(); } catch (err) { toast(String(err), "err"); } });
     m.querySelector("#sClear").onclick = () => openModal(`
       <h2>${esc(t("clearConfirm"))}</h2><p class="sub">${esc(t("clearConfirmSub", { n: state.accounts.length }))}</p>
       <label class="check"><input type="checkbox" id="cForget"/> ${esc(t("clearForget"))}</label>
@@ -354,8 +496,13 @@ function settingsModal() {
 // ---------- context menu ----------
 function openMenu(a, x, y) {
   const menu = $("#menu");
+  const mode = a.login_mode || "";
   menu.innerHTML = `
     <button data-m="switch">${ICON.bolt} ${esc(t("doSwitch"))}</button>
+    ${mode !== "invisible" ? `<button data-m="invisible">${ICON.eye} ${esc(t("mInvisible"))}</button>` : ""}
+    ${mode !== "offline" ? `<button data-m="offline">${ICON.plane} ${esc(t("mOffline"))}</button>` : ""}
+    ${mode ? `<button data-m="normal">${ICON.bolt} ${esc(t("mNormal"))}</button>` : ""}
+    <hr/>
     <button data-m="edit">${ICON.edit} ${esc(t("mEdit"))}</button>
     <button data-m="copy">${ICON.copy} ${esc(t("mCopyId"))}</button>
     <button data-m="copyName">${ICON.copy} ${esc(t("mCopyName"))}</button>
@@ -370,6 +517,9 @@ function openMenu(a, x, y) {
     menu.hidden = true;
     ({
       switch: () => switchTo(a.steamid),
+      invisible: () => switchTo(a.steamid, "invisible"),
+      offline: () => switchTo(a.steamid, "offline"),
+      normal: () => switchTo(a.steamid, ""),
       edit: () => editModal(a),
       copy: () => copy(a.steamid, t("copiedId")),
       copyName: () => copy(a.account_name, t("copiedName")),
@@ -430,11 +580,30 @@ document.addEventListener("keydown", (e) => {
   } else if (e.key === "Enter" && e.target.closest(".card")) switchTo(e.target.closest(".card").dataset.id);
 });
 
+// ---------- cooldown ticker ----------
+setInterval(() => {
+  let ended = false;
+  document.querySelectorAll(".cd[data-until]").forEach((el) => {
+    const left = +el.dataset.until - now();
+    el.textContent = fmtLeft(left);
+    if (left <= 0) ended = true;
+  });
+  if (!ended) return;
+  state.accounts.filter((a) => a.cooldown_until && a.cooldown_until <= now() && !a._cdToasted).forEach((a) => {
+    a._cdToasted = true;
+    toast(t("cdEnded", { name: nameOf(a) }), "info");
+  });
+  render();
+}, 1000);
+
 // ---------- boot ----------
 (async () => {
   applyStatic();
   await refreshStatus();
   await loadAccounts();
+  loadAvatars();
   if (store.get("autoCapture") !== "0" && state.status.steam_found) await capture(true);
   setInterval(() => { if (!state.switching) refreshStatus(); }, 3000);
+  refreshProfiles(); // background; only accounts not checked in the last 6 h
+  if (store.get("autoUpdate") !== "0") setTimeout(checkUpdate, 4000);
 })();

@@ -211,5 +211,9 @@ fn write_kv(out: &mut String, key: &str, val: &Vdf, depth: usize) {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    // mirror the lexer: \n and \t are decoded on read, so encode them again on write
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }

@@ -1,42 +1,64 @@
+mod dpapi;
+mod profile;
 mod vdf;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::AppHandle;
 use vdf::Vdf;
 use winreg::enums::*;
 use winreg::RegKey;
 
 const STEAM_REG: &str = r"Software\Valve\Steam";
+const STEAMID64_BASE: u64 = 76561197960265728;
+/// Re-check public profile info at most this often (seconds).
+const PROFILE_TTL: u64 = 6 * 3600;
 
 // ---------- data model ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Account {
     pub steamid: String,      // SteamID64
     pub account_name: String, // Steam login name
-    #[serde(default)]
-    pub persona: String, // Steam display name
-    #[serde(default)]
-    pub nickname: String, // our custom label
-    #[serde(default)]
+    pub persona: String,      // Steam display name
+    pub nickname: String,     // our custom label
     pub note: String,
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub color: String,
-    #[serde(default)]
     pub favorite: bool,
-    #[serde(default)]
     pub last_switch: u64,
-    #[serde(default)]
     pub timestamp: u64, // steam last-login timestamp
-    #[serde(default)]
     pub has_token: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Plain token, kept in memory only. Old (v1.0) stores have it on disk; it is
+    /// migrated to `token_enc` on first load.
+    #[serde(skip_serializing)]
     pub token: String,
+    /// DPAPI-encrypted token (base64). Never sent to the UI.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token_enc: String,
+
+    // public profile (steamcommunity.com XML)
+    pub vac_banned: bool,
+    pub trade_ban: String,
+    pub limited: bool,
+    pub privacy: String,
+    pub profile_found: bool,
+    pub profile_checked: u64,
+
+    // cooldown countdown
+    pub cooldown_until: u64,
+    pub cooldown_reason: String,
+
+    /// "" (normal), "invisible" or "offline"
+    pub login_mode: String,
+    /// We set this account to invisible earlier and should restore it.
+    pub invisible_applied: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,10 +115,7 @@ fn steam_path() -> Option<PathBuf> {
         }
     }
     // HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath
-    for key in [
-        r"SOFTWARE\WOW6432Node\Valve\Steam",
-        r"SOFTWARE\Valve\Steam",
-    ] {
+    for key in [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"] {
         if let Ok(k) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(key) {
             if let Ok(p) = k.get_value::<String, _>("InstallPath") {
                 let pb = PathBuf::from(p);
@@ -126,26 +145,93 @@ fn config_vdf_path() -> Option<PathBuf> {
     Some(steam_path()?.join("config").join("config.vdf"))
 }
 
+fn steamid32(steamid64: &str) -> Option<u64> {
+    steamid64.parse::<u64>().ok()?.checked_sub(STEAMID64_BASE)
+}
+
+fn localconfig_path(steamid64: &str) -> Option<PathBuf> {
+    Some(
+        steam_path()?
+            .join("userdata")
+            .join(steamid32(steamid64)?.to_string())
+            .join("config")
+            .join("localconfig.vdf"),
+    )
+}
+
 // ---------- our store ----------
 
-fn store_path() -> PathBuf {
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn app_dir() -> PathBuf {
     let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("nfa-next");
     let _ = fs::create_dir_all(&p);
-    p.push("accounts.json");
     p
 }
 
-fn load_store() -> Vec<Account> {
-    match fs::read_to_string(store_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+fn store_path() -> PathBuf {
+    app_dir().join("accounts.json")
 }
 
-fn save_store(list: &[Account]) -> Result<(), String> {
+/// Load from disk, decrypt tokens, migrate any plaintext token from v1.0.
+fn load_store_raw() -> Vec<Account> {
+    let mut list: Vec<Account> = match fs::read_to_string(store_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mut migrate = false;
+    for a in list.iter_mut() {
+        if !a.token.is_empty() && a.token_enc.is_empty() {
+            migrate = true; // plaintext from an old version
+        } else if !a.token_enc.is_empty() {
+            a.token = dpapi::unprotect(&a.token_enc).unwrap_or_default();
+        }
+    }
+    if migrate {
+        let _ = save_store_raw(&mut list);
+    }
+    list
+}
+
+/// Encrypt tokens and write. Plain tokens never reach the disk.
+fn save_store_raw(list: &mut [Account]) -> Result<(), String> {
+    for a in list.iter_mut() {
+        if a.token.is_empty() {
+            a.token_enc.clear();
+        } else if dpapi::unprotect(&a.token_enc).as_deref() != Some(a.token.as_str()) {
+            a.token_enc = dpapi::protect(&a.token).ok_or("Could not encrypt the token (DPAPI).")?;
+        }
+    }
     let s = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-    fs::write(store_path(), s).map_err(|e| e.to_string())
+    // write to a temp file first so a crash can't leave a half-written store
+    let tmp = store_path().with_extension("json.tmp");
+    fs::write(&tmp, s).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, store_path()).map_err(|e| e.to_string())
+}
+
+fn load_store() -> Vec<Account> {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_store_raw()
+}
+
+/// Load, change and save the store under one lock, so concurrent commands
+/// (a running switch, a profile refresh, an edit) can't overwrite each other.
+fn modify_store<R>(f: impl FnOnce(&mut Vec<Account>) -> Result<R, String>) -> Result<R, String> {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut list = load_store_raw();
+    let r = f(&mut list)?;
+    save_store_raw(&mut list)?;
+    Ok(r)
+}
+
+/// What the UI gets: no secrets.
+fn for_ui(mut list: Vec<Account>) -> Vec<Account> {
+    for a in list.iter_mut() {
+        a.token.clear();
+        a.token_enc.clear();
+    }
+    list
 }
 
 // ---------- vdf account ops ----------
@@ -153,7 +239,6 @@ fn save_store(list: &[Account]) -> Result<(), String> {
 fn read_loginusers() -> Result<Vdf, String> {
     let p = loginusers_path().ok_or("Steam not found — is it installed?")?;
     if !p.exists() {
-        // empty users root
         return Ok(Vdf::Obj(vec![("users".into(), Vdf::Obj(vec![]))]));
     }
     let text = fs::read_to_string(&p).map_err(|e| format!("read loginusers.vdf: {e}"))?;
@@ -174,7 +259,18 @@ fn active_account_name() -> String {
         .unwrap_or_default()
 }
 
-// ---------- commands ----------
+fn new_account(steamid: &str, account_name: &str, persona: &str, ts: u64) -> Account {
+    Account {
+        steamid: steamid.to_string(),
+        account_name: account_name.to_string(),
+        persona: persona.to_string(),
+        color: pick_color(steamid),
+        timestamp: ts,
+        ..Default::default()
+    }
+}
+
+// ---------- commands: status & accounts ----------
 
 #[tauri::command]
 async fn get_status() -> Status {
@@ -202,72 +298,60 @@ fn status_impl() -> Status {
 #[tauri::command]
 fn capture_accounts() -> Result<Vec<Account>, String> {
     let root = read_loginusers()?;
-    let mut store = load_store();
-
-    if let Some(users) = root.get("users").and_then(|u| u.obj()) {
-        for (steamid, data) in users {
-            let account_name = data.get_str("AccountName").unwrap_or("").to_string();
-            let persona = data.get_str("PersonaName").unwrap_or("").to_string();
-            let ts: u64 = data.get_str("Timestamp").and_then(|s| s.parse().ok()).unwrap_or(0);
-            if account_name.is_empty() {
-                continue;
-            }
-            match store.iter_mut().find(|a| a.steamid == *steamid) {
-                Some(a) => {
-                    a.account_name = account_name;
-                    if !persona.is_empty() {
-                        a.persona = persona;
-                    }
-                    if ts > 0 {
-                        a.timestamp = ts;
-                    }
+    let list = modify_store(|store| {
+        if let Some(users) = root.get("users").and_then(|u| u.obj()) {
+            for (steamid, data) in users {
+                let account_name = data.get_str("AccountName").unwrap_or("").to_string();
+                let persona = data.get_str("PersonaName").unwrap_or("").to_string();
+                let ts: u64 = data.get_str("Timestamp").and_then(|s| s.parse().ok()).unwrap_or(0);
+                if account_name.is_empty() {
+                    continue;
                 }
-                None => store.push(Account {
-                    steamid: steamid.clone(),
-                    account_name: account_name.clone(),
-                    persona,
-                    nickname: String::new(),
-                    note: String::new(),
-                    tags: vec![],
-                    color: pick_color(steamid),
-                    favorite: false,
-                    last_switch: 0,
-                    timestamp: ts,
-                    has_token: false,
-                    token: String::new(),
-                }),
+                match store.iter_mut().find(|a| a.steamid == *steamid) {
+                    Some(a) => {
+                        a.account_name = account_name;
+                        if !persona.is_empty() {
+                            a.persona = persona;
+                        }
+                        if ts > 0 {
+                            a.timestamp = ts;
+                        }
+                    }
+                    None => store.push(new_account(steamid, &account_name, &persona, ts)),
+                }
             }
         }
-    }
-    save_store(&store)?;
-    Ok(store)
+        Ok(store.clone())
+    })?;
+    Ok(for_ui(list))
 }
 
 #[tauri::command]
 fn list_accounts() -> Vec<Account> {
-    load_store()
+    for_ui(load_store())
 }
 
+// ---------- commands: switching ----------
+
 /// Switch Steam to `steamid`: shut down Steam, set auto-login, mark MostRecent, relaunch.
+/// `mode` overrides the account's saved login mode for this one switch.
 #[tauri::command]
-async fn switch_account(steamid: String) -> Result<String, String> {
-    // blocking work (shutdown wait, file + registry IO) off the UI thread
-    tauri::async_runtime::spawn_blocking(move || switch_impl(steamid))
+async fn switch_account(steamid: String, mode: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || switch_impl(steamid, mode))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn switch_impl(steamid: String) -> Result<String, String> {
-    let mut store = load_store();
-    let acc = store
-        .iter()
+fn switch_impl(steamid: String, mode: Option<String>) -> Result<String, String> {
+    let acc = load_store()
+        .into_iter()
         .find(|a| a.steamid == steamid)
-        .cloned()
         .ok_or("Account not found.")?;
     if acc.account_name.is_empty() {
         return Err("Account has no Steam login name.".into());
     }
     steam_exe().ok_or("Steam not found — is it installed?")?;
+    let mode = mode.unwrap_or_else(|| acc.login_mode.clone());
 
     stop_steam()?;
 
@@ -289,48 +373,120 @@ fn switch_impl(steamid: String) -> Result<String, String> {
     let mut root = read_loginusers()?;
     if let Some(users) = root.get_mut("users").and_then(|u| u.obj_mut()) {
         for (sid, data) in users.iter_mut() {
-            let most = if *sid == steamid { "1" } else { "0" };
-            data.set_str("MostRecent", most);
-            if *sid == steamid {
+            let target = *sid == steamid;
+            data.set_str("MostRecent", if target { "1" } else { "0" });
+            if target {
                 data.set_str("RememberPassword", "1");
                 data.set_str("AllowAutoLogin", "1");
+                if mode == "offline" {
+                    data.set_str("WantsOfflineMode", "1");
+                    data.set_str("SkipOfflineModeWarning", "1");
+                } else {
+                    data.set_str("WantsOfflineMode", "0");
+                }
             }
         }
     }
     write_loginusers(&root)?;
 
-    // relaunch steam
-    launch_steam()?;
-
-    // record
-    if let Some(a) = store.iter_mut().find(|a| a.steamid == steamid) {
-        a.last_switch = now();
+    // friends status: invisible, or undo an invisible we set before
+    let mut invisible_applied = acc.invisible_applied;
+    if mode == "invisible" {
+        let _ = set_persona_state(&steamid, 7);
+        invisible_applied = true;
+    } else if acc.invisible_applied {
+        let _ = set_persona_state(&steamid, 1);
+        invisible_applied = false;
     }
-    save_store(&store)?;
+
+    launch_steam()?;
+    if mode == "invisible" {
+        nudge_status_later(acc.account_name.clone(), "invisible");
+    }
+
+    modify_store(|store| {
+        if let Some(a) = store.iter_mut().find(|a| a.steamid == steamid) {
+            a.last_switch = now();
+            a.invisible_applied = invisible_applied;
+        }
+        Ok(())
+    })?;
 
     Ok(format!("Switched to {}", display_name(&acc)))
 }
 
+/// Set the desired friends status in userdata/<id32>/config/localconfig.vdf.
+/// 1 = online, 7 = invisible. Steam must be closed while this runs.
+fn set_persona_state(steamid64: &str, state: u8) -> Result<(), String> {
+    let p = localconfig_path(steamid64).ok_or("no localconfig path")?;
+    if !p.exists() {
+        return Ok(()); // never signed in on this PC; the steam:// fallback handles it
+    }
+    let text = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut root = vdf::parse(&text)?;
+    let id32 = steamid32(steamid64).ok_or("bad steamid")?.to_string();
+    let store = root.get_mut("UserLocalConfigStore").ok_or("unexpected localconfig layout")?;
+
+    // newer clients: WebStorage/FriendStoreLocalPrefs_<id32> = JSON with ePersonaState
+    let key = format!("FriendStoreLocalPrefs_{id32}");
+    if store.get("WebStorage").is_none() {
+        if let Some(o) = store.obj_mut() {
+            o.push(("WebStorage".into(), Vdf::Obj(vec![])));
+        }
+    }
+    if let Some(ws) = store.get_mut("WebStorage") {
+        let mut json: serde_json::Value = ws
+            .get_str(&key)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({ "strNonFriendsAllowedToMsg": "" }));
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("ePersonaState".into(), serde_json::json!(state));
+        }
+        ws.set_str(&key, &json.to_string());
+    }
+    // older clients: friends/PersonaStateDesired
+    if let Some(friends) = store.get_mut("friends") {
+        friends.set_str("PersonaStateDesired", &state.to_string());
+    }
+    fs::write(&p, vdf::serialize(&root)).map_err(|e| e.to_string())
+}
+
+/// Once Steam is up, ask it for the status via steam:// as a fallback for the
+/// file edit above. Skipped if the user switched to another account meanwhile.
+fn nudge_status_later(account_name: String, status: &'static str) {
+    std::thread::spawn(move || {
+        for _ in 0..60 {
+            if is_running("steamwebhelper.exe") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        if active_account_name().eq_ignore_ascii_case(&account_name) && is_running("steam.exe") {
+            let _ = cmd("explorer.exe")
+                .arg(format!("steam://friends/status/{status}"))
+                .spawn();
+        }
+    });
+}
+
+// ---------- commands: token ----------
+
 /// Add an account by a Steam login token (best-effort). Registers it so it can be switched to.
 #[tauri::command]
-fn add_account_token(
-    token: String,
-    account_name: String,
-    persona: String,
-) -> Result<Account, String> {
+fn add_account_token(token: String, account_name: String, persona: String) -> Result<Account, String> {
     let token = token.trim().to_string();
     if token.is_empty() {
         return Err("Token is empty.".into());
     }
-    // derive steamid from the JWT payload (sub)
     let steamid = steamid_from_token(&token)
         .ok_or("That token doesn't look like a valid Steam login token.")?;
-
     let name = if account_name.trim().is_empty() {
         format!("user_{}", &steamid[steamid.len().saturating_sub(6)..])
     } else {
         account_name.trim().to_string()
     };
+    let persona = persona.trim().to_string();
 
     // register in loginusers.vdf
     let mut root = read_loginusers()?;
@@ -339,16 +495,16 @@ fn add_account_token(
             .get_mut("users")
             .and_then(|u| u.obj_mut())
             .ok_or("loginusers.vdf is malformed.")?;
-        let entry = match users.iter_mut().find(|(sid, _)| *sid == steamid) {
-            Some((_, v)) => v,
+        let entry = match users.iter_mut().position(|(sid, _)| *sid == steamid) {
+            Some(i) => &mut users[i].1,
             None => {
                 users.push((steamid.clone(), Vdf::Obj(vec![])));
                 &mut users.last_mut().unwrap().1
             }
         };
         entry.set_str("AccountName", &name);
-        if !persona.trim().is_empty() {
-            entry.set_str("PersonaName", persona.trim());
+        if !persona.is_empty() {
+            entry.set_str("PersonaName", &persona);
         }
         entry.set_str("RememberPassword", "1");
         entry.set_str("AllowAutoLogin", "1");
@@ -360,36 +516,29 @@ fn add_account_token(
     write_loginusers(&root)?;
     let _ = ensure_config_account(&name, &steamid);
 
-    // save into our store
-    let mut store = load_store();
-    let acc = Account {
-        steamid: steamid.clone(),
-        account_name: name.clone(),
-        persona: persona.trim().to_string(),
-        nickname: String::new(),
-        note: String::new(),
-        tags: vec!["Token".into()],
-        color: pick_color(&steamid),
-        favorite: false,
-        last_switch: 0,
-        timestamp: now(),
-        has_token: true,
-        token,
-    };
-    match store.iter_mut().find(|a| a.steamid == steamid) {
-        Some(a) => {
-            a.account_name = acc.account_name.clone();
-            a.has_token = true;
-            a.token = acc.token.clone();
-            if !acc.persona.is_empty() {
-                a.persona = acc.persona.clone();
+    let acc = modify_store(|store| {
+        let idx = match store.iter().position(|a| a.steamid == steamid) {
+            Some(i) => i,
+            None => {
+                let mut a = new_account(&steamid, &name, &persona, now());
+                a.tags = vec!["Token".into()];
+                store.push(a);
+                store.len() - 1
             }
+        };
+        let a = &mut store[idx];
+        a.account_name = name.clone();
+        a.has_token = true;
+        a.token = token.clone();
+        if !persona.is_empty() {
+            a.persona = persona.clone();
         }
-        None => store.push(acc.clone()),
-    }
-    save_store(&store)?;
-    Ok(acc)
+        Ok(a.clone())
+    })?;
+    Ok(for_ui(vec![acc]).remove(0))
 }
+
+// ---------- commands: editing ----------
 
 #[derive(Deserialize)]
 pub struct AccountEdit {
@@ -399,38 +548,56 @@ pub struct AccountEdit {
     pub tags: Option<Vec<String>>,
     pub color: Option<String>,
     pub favorite: Option<bool>,
+    pub cooldown_until: Option<u64>,
+    pub cooldown_reason: Option<String>,
+    pub login_mode: Option<String>,
 }
 
 #[tauri::command]
 fn update_account(edit: AccountEdit) -> Result<(), String> {
-    let mut store = load_store();
-    let a = store
-        .iter_mut()
-        .find(|a| a.steamid == edit.steamid)
-        .ok_or("Account not found.")?;
-    if let Some(v) = edit.nickname {
-        a.nickname = v;
-    }
-    if let Some(v) = edit.note {
-        a.note = v;
-    }
-    if let Some(v) = edit.tags {
-        a.tags = v;
-    }
-    if let Some(v) = edit.color {
-        a.color = v;
-    }
-    if let Some(v) = edit.favorite {
-        a.favorite = v;
-    }
-    save_store(&store)
+    modify_store(|store| {
+        let a = store
+            .iter_mut()
+            .find(|a| a.steamid == edit.steamid)
+            .ok_or("Account not found.")?;
+        if let Some(v) = edit.nickname {
+            a.nickname = v;
+        }
+        if let Some(v) = edit.note {
+            a.note = v;
+        }
+        if let Some(v) = edit.tags {
+            a.tags = v;
+        }
+        if let Some(v) = edit.color {
+            a.color = v;
+        }
+        if let Some(v) = edit.favorite {
+            a.favorite = v;
+        }
+        if let Some(v) = edit.cooldown_until {
+            a.cooldown_until = v;
+        }
+        if let Some(v) = edit.cooldown_reason {
+            a.cooldown_reason = v;
+        }
+        if let Some(v) = edit.login_mode {
+            a.login_mode = match v.as_str() {
+                "invisible" | "offline" => v,
+                _ => String::new(),
+            };
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
 fn remove_account(steamid: String, forget_steam: bool) -> Result<(), String> {
-    let mut store = load_store();
-    store.retain(|a| a.steamid != steamid);
-    save_store(&store)?;
+    modify_store(|store| {
+        store.retain(|a| a.steamid != steamid);
+        Ok(())
+    })?;
+    let _ = fs::remove_file(profile::avatar_dir().join(format!("{steamid}.jpg")));
     if forget_steam {
         let mut root = read_loginusers()?;
         if let Some(users) = root.get_mut("users").and_then(|u| u.obj_mut()) {
@@ -443,7 +610,10 @@ fn remove_account(steamid: String, forget_steam: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn clear_all(forget_steam: bool) -> Result<(), String> {
-    save_store(&[])?;
+    modify_store(|store| {
+        store.clear();
+        Ok(())
+    })?;
     if forget_steam {
         let mut root = read_loginusers()?;
         if let Some(users) = root.get_mut("users").and_then(|u| u.obj_mut()) {
@@ -453,6 +623,284 @@ fn clear_all(forget_steam: bool) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------- commands: profiles & avatars ----------
+
+/// steamid -> data: URL. Our downloaded avatar first, then Steam's local avatar cache.
+#[tauri::command]
+async fn get_avatars() -> HashMap<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let cache = steam_path().map(|p| p.join("config").join("avatarcache"));
+        let mut out = HashMap::new();
+        for a in load_store() {
+            let ours = profile::avatar_dir().join(format!("{}.jpg", a.steamid));
+            let url = profile::data_url(&ours).or_else(|| {
+                cache.as_ref().and_then(|c| profile::data_url(&c.join(format!("{}.png", a.steamid))))
+            });
+            if let Some(u) = url {
+                out.insert(a.steamid, u);
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Look up public profile info (bans, privacy, avatar) for accounts that are
+/// due, or all of them with `force`. Returns the updated list.
+#[tauri::command]
+async fn refresh_profiles(force: bool) -> Result<Vec<Account>, String> {
+    tauri::async_runtime::spawn_blocking(move || refresh_profiles_impl(force))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn refresh_profiles_impl(force: bool) -> Result<Vec<Account>, String> {
+    let due: Vec<String> = load_store()
+        .into_iter()
+        .filter(|a| force || now().saturating_sub(a.profile_checked) > PROFILE_TTL)
+        .map(|a| a.steamid)
+        .collect();
+
+    // network work happens outside the store lock
+    let mut results: Vec<(String, profile::ProfileInfo)> = Vec::new();
+    let mut failures = 0;
+    for (i, sid) in due.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(400)); // be polite
+        }
+        match profile::fetch_profile(sid) {
+            Ok(info) => {
+                if info.found && !info.avatar_url.is_empty() {
+                    let _ = profile::download_avatar(sid, &info.avatar_url);
+                }
+                results.push((sid.clone(), info));
+            }
+            Err(_) => failures += 1,
+        }
+    }
+    if !due.is_empty() && results.is_empty() && failures > 0 {
+        return Err("Couldn't reach steamcommunity.com.".into());
+    }
+
+    let list = modify_store(|store| {
+        for (sid, info) in &results {
+            if let Some(a) = store.iter_mut().find(|a| a.steamid == *sid) {
+                a.profile_checked = now();
+                a.profile_found = info.found;
+                if info.found {
+                    a.vac_banned = info.vac_banned;
+                    a.trade_ban = info.trade_ban.clone();
+                    a.limited = info.limited;
+                    a.privacy = info.privacy.clone();
+                    if a.persona.is_empty() && !info.persona.is_empty() {
+                        a.persona = info.persona.clone();
+                    }
+                }
+            }
+        }
+        Ok(store.clone())
+    })?;
+    Ok(for_ui(list))
+}
+
+// ---------- commands: backup ----------
+
+#[derive(Serialize, Deserialize)]
+struct Backup {
+    app: String,
+    version: u32,
+    exported: u64,
+    accounts: Vec<BackupAccount>,
+}
+
+/// Everything a user typed, but no tokens: DPAPI blobs only open on this PC anyway.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct BackupAccount {
+    steamid: String,
+    account_name: String,
+    persona: String,
+    nickname: String,
+    note: String,
+    tags: Vec<String>,
+    color: String,
+    favorite: bool,
+    cooldown_until: u64,
+    cooldown_reason: String,
+    login_mode: String,
+}
+
+#[derive(Serialize)]
+struct ImportResult {
+    added: usize,
+    updated: usize,
+    accounts: Vec<Account>,
+}
+
+#[tauri::command]
+async fn export_backup(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let date = {
+            // yyyy-mm-dd without a date crate
+            let days = (now() / 86400) as i64;
+            let (y, m, d) = civil_from_days(days);
+            format!("{y:04}-{m:02}-{d:02}")
+        };
+        let Some(path) = app
+            .dialog()
+            .file()
+            .add_filter("JSON", &["json"])
+            .set_file_name(format!("nfa-next-backup-{date}.json"))
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        let backup = Backup {
+            app: "nfa-next".into(),
+            version: 1,
+            exported: now(),
+            accounts: load_store()
+                .into_iter()
+                .map(|a| BackupAccount {
+                    steamid: a.steamid,
+                    account_name: a.account_name,
+                    persona: a.persona,
+                    nickname: a.nickname,
+                    note: a.note,
+                    tags: a.tags,
+                    color: a.color,
+                    favorite: a.favorite,
+                    cooldown_until: a.cooldown_until,
+                    cooldown_reason: a.cooldown_reason,
+                    login_mode: a.login_mode,
+                })
+                .collect(),
+        };
+        let s = serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())?;
+        fs::write(&path, s).map_err(|e| e.to_string())?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn import_backup(app: AppHandle) -> Result<Option<ImportResult>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app.dialog().file().add_filter("JSON", &["json"]).blocking_pick_file() else {
+            return Ok(None);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let backup: Backup = serde_json::from_str(&text).map_err(|_| "This isn't an NFA Next backup file.".to_string())?;
+        if backup.app != "nfa-next" {
+            return Err("This isn't an NFA Next backup file.".into());
+        }
+        let r = merge_backup(backup.accounts)?;
+        Ok(Some(r))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn merge_backup(items: Vec<BackupAccount>) -> Result<ImportResult, String> {
+    let (added, updated, list) = modify_store(|store| {
+        let (mut added, mut updated) = (0, 0);
+        for b in items {
+            if b.steamid.is_empty() || !b.steamid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let idx = match store.iter().position(|a| a.steamid == b.steamid) {
+                Some(i) => {
+                    updated += 1;
+                    i
+                }
+                None => {
+                    added += 1;
+                    store.push(new_account(&b.steamid, &b.account_name, &b.persona, 0));
+                    store.len() - 1
+                }
+            };
+            let a = &mut store[idx];
+            if a.account_name.is_empty() {
+                a.account_name = b.account_name;
+            }
+            if a.persona.is_empty() {
+                a.persona = b.persona;
+            }
+            a.nickname = b.nickname;
+            a.note = b.note;
+            a.tags = b.tags;
+            if !b.color.is_empty() {
+                a.color = b.color;
+            }
+            a.favorite = b.favorite;
+            a.cooldown_until = b.cooldown_until;
+            a.cooldown_reason = b.cooldown_reason;
+            a.login_mode = b.login_mode;
+        }
+        Ok((added, updated, store.clone()))
+    })?;
+    Ok(ImportResult { added, updated, accounts: for_ui(list) })
+}
+
+/// Days since 1970-01-01 -> (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
+// ---------- commands: updates ----------
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: String,
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(update.map(|u| UpdateInfo { version: u.version.clone(), notes: u.body.clone().unwrap_or_default() }))
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("No update available.")?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart();
+}
+
+// ---------- commands: steam process ----------
 
 #[tauri::command]
 async fn stop_steam_cmd() -> Result<(), String> {
@@ -480,9 +928,7 @@ fn launch_steam() -> Result<(), String> {
 
 fn stop_steam() -> Result<(), String> {
     if let Some(exe) = steam_exe() {
-        let _ = cmd(exe.to_string_lossy().as_ref())
-            .arg("-shutdown")
-            .spawn();
+        let _ = cmd(exe.to_string_lossy().as_ref()).arg("-shutdown").spawn();
     }
     // wait up to ~8s for a clean exit
     for _ in 0..16 {
@@ -494,9 +940,7 @@ fn stop_steam() -> Result<(), String> {
     if is_running("steam.exe") {
         let _ = cmd("taskkill").args(["/F", "/IM", "steam.exe", "/T"]).output();
     }
-    let _ = cmd("taskkill")
-        .args(["/F", "/IM", "steamwebhelper.exe", "/T"])
-        .output();
+    let _ = cmd("taskkill").args(["/F", "/IM", "steamwebhelper.exe", "/T"]).output();
     std::thread::sleep(std::time::Duration::from_millis(700));
     Ok(())
 }
@@ -509,7 +953,6 @@ fn ensure_config_account(name: &str, steamid: &str) -> Result<(), String> {
     }
     let text = fs::read_to_string(&p).map_err(|e| format!("read config.vdf: {e}"))?;
     let mut root = vdf::parse(&text)?;
-    // navigate InstallConfigStore/Software/Valve/Steam/Accounts
     fn child<'a>(v: &'a mut Vdf, key: &str) -> Option<&'a mut Vdf> {
         v.obj_mut()?
             .iter_mut()
@@ -523,7 +966,6 @@ fn ensure_config_account(name: &str, steamid: &str) -> Result<(), String> {
             None => return Ok(()), // unexpected layout; skip quietly
         };
     }
-    // Accounts block
     if child(cur, "Accounts").is_none() {
         if let Some(obj) = cur.obj_mut() {
             obj.push(("Accounts".into(), Vdf::Obj(vec![])));
@@ -556,30 +998,8 @@ fn steamid_from_token(token: &str) -> Option<String> {
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut lut = [255u8; 256];
-    for (i, &c) in T.iter().enumerate() {
-        lut[c as usize] = i as u8;
-    }
-    let mut out = Vec::new();
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let v = lut[c as usize];
-        if v == 255 {
-            return None;
-        }
-        buf = (buf << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }
 
 fn pick_color(seed: &str) -> String {
@@ -606,6 +1026,8 @@ fn display_name(a: &Account) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_status,
             capture_accounts,
@@ -615,6 +1037,12 @@ pub fn run() {
             update_account,
             remove_account,
             clear_all,
+            get_avatars,
+            refresh_profiles,
+            export_backup,
+            import_backup,
+            check_update,
+            install_update,
             stop_steam_cmd,
             open_steam
         ])
@@ -651,11 +1079,52 @@ mod tests {
     }
 
     #[test]
+    fn vdf_keeps_escapes() {
+        let src = "\"a\"\n{\n\t\"j\"\t\t\"{\\\"x\\\":1}\"\n\t\"n\"\t\t\"line1\\nline2\\ttab\"\n}\n";
+        let v = vdf::parse(src).unwrap();
+        assert_eq!(v.get("a").unwrap().get_str("j"), Some("{\"x\":1}"));
+        assert_eq!(vdf::serialize(&v), src);
+    }
+
+    #[test]
     fn jwt_sub_decodes() {
         // header.{"sub":"76561198000000001"}.sig (base64url, no padding)
         let tok = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiI3NjU2MTE5ODAwMDAwMDAwMSJ9.sig";
         assert_eq!(steamid_from_token(tok).as_deref(), Some("76561198000000001"));
         assert_eq!(steamid_from_token("not.a.token"), None);
         assert_eq!(steamid_from_token("garbage"), None);
+    }
+
+    #[test]
+    fn steamid_conversion() {
+        assert_eq!(steamid32("76561198000000001"), Some(39734273));
+        assert_eq!(steamid32("12"), None);
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20775), (2026, 11, 18));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_roundtrip() {
+        let enc = dpapi::protect("eyJ.secret.token").unwrap();
+        assert!(!enc.contains("secret"));
+        assert_eq!(dpapi::unprotect(&enc).as_deref(), Some("eyJ.secret.token"));
+        assert_eq!(dpapi::unprotect("bm90LWEtYmxvYg=="), None);
+    }
+
+    #[test]
+    fn token_never_serialized() {
+        let a = Account { token: "eyJ.secret".into(), token_enc: "ENC".into(), ..Default::default() };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(!s.contains("eyJ.secret"));
+        let ui = serde_json::to_string(&for_ui(vec![a])).unwrap();
+        assert!(!ui.contains("ENC"));
+        // v1.0 files had a plaintext "token" field; it must still load
+        let old: Account = serde_json::from_str(r#"{"steamid":"1","account_name":"x","token":"eyJ.old"}"#).unwrap();
+        assert_eq!(old.token, "eyJ.old");
     }
 }
