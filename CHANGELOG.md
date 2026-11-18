@@ -3,8 +3,7 @@
 ## 1.2.1
 
 ### Fixed
-- Steam's `config.vdf` could be rewritten with `	` / `
-` escapes where Steam keeps raw tabs and newlines. This only happened for accounts added with a token. NFA Next now writes Steam's files back exactly as Steam does (checked against real `loginusers.vdf`, `config.vdf` and `localconfig.vdf` files).
+- Steam's `config.vdf` could be rewritten with `\t` / `\n` escapes where Steam keeps raw tabs and newlines. This only happened for accounts added with a token. NFA Next now writes Steam's files back exactly as Steam does (checked against real `loginusers.vdf`, `config.vdf` and `localconfig.vdf` files).
 
 ## 1.2.0
 
