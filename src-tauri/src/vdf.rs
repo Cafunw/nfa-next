@@ -211,9 +211,6 @@ fn write_kv(out: &mut String, key: &str, val: &Vdf, depth: usize) {
 }
 
 fn esc(s: &str) -> String {
-    // mirror the lexer: \n and \t are decoded on read, so encode them again on write
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\t', "\\t")
+    // Steam escapes only \\ and \"; raw tabs/newlines inside values stay raw (seen in config.vdf)
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }

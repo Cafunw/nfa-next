@@ -1439,7 +1439,8 @@ mod tests {
 
     #[test]
     fn vdf_keeps_escapes() {
-        let src = "\"a\"\n{\n\t\"j\"\t\t\"{\\\"x\\\":1}\"\n\t\"n\"\t\t\"line1\\nline2\\ttab\"\n}\n";
+        // raw newline + tab inside a value and an escaped backslash, as Steam writes them
+        let src = "\"a\"\n{\n\t\"j\"\t\t\"{\\\"x\\\":1}\"\n\t\"n\"\t\t\"line1\nline2\ttab C:\\\\x\"\n}\n";
         let v = vdf::parse(src).unwrap();
         assert_eq!(v.get("a").unwrap().get_str("j"), Some("{\"x\":1}"));
         assert_eq!(vdf::serialize(&v), src);
@@ -1503,5 +1504,70 @@ mod tests {
         // v1.0 files had a plaintext "token" field; it must still load
         let old: Account = serde_json::from_str(r#"{"steamid":"1","account_name":"x","token":"eyJ.old"}"#).unwrap();
         assert_eq!(old.token, "eyJ.old");
+    }
+}
+
+#[cfg(test)]
+mod live_checks {
+    //! Read-only checks against this PC's Steam install. Run with:
+    //! cargo test --lib live_checks -- --ignored --nocapture
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn read_only_real_steam() {
+        let sp = steam_path().expect("steam");
+        println!("steam found: true");
+        let rt = tauri::async_runtime::block_on(list_games());
+        println!("installed games: {}", rt.len());
+        let store = load_store();
+        println!("accounts in store: {}", store.len());
+        let cache = sp.join("config").join("avatarcache");
+        let local = store.iter().filter(|a| cache.join(format!("{}.png", a.steamid)).exists()).count();
+        println!("accounts with Steam avatar cache: {local}");
+        let mut with_lc = 0;
+        let mut with_prefs = 0;
+        let mut with_friends = 0;
+        for a in &store {
+            let Some(p) = localconfig_path(&a.steamid) else { continue };
+            let Ok(t) = fs::read_to_string(&p) else { continue };
+            with_lc += 1;
+            let v = vdf::parse(&t).expect("localconfig parses");
+            // round trip must not change a byte we don't touch
+            assert_eq!(vdf::parse(&vdf::serialize(&v)).unwrap().get("UserLocalConfigStore").is_some(), true);
+            let s = v.get("UserLocalConfigStore").unwrap();
+            let id32 = steamid32(&a.steamid).unwrap();
+            if let Some(j) = s.get("WebStorage").and_then(|w| w.get_str(&format!("FriendStoreLocalPrefs_{id32}"))) {
+                with_prefs += 1;
+                let json: serde_json::Value = serde_json::from_str(j).expect("prefs json");
+                println!("  prefs has ePersonaState: {}", json.get("ePersonaState").is_some());
+            }
+            if s.get("friends").is_some() {
+                with_friends += 1;
+            }
+        }
+        println!("localconfig.vdf found: {with_lc}, FriendStoreLocalPrefs: {with_prefs}, friends block: {with_friends}");
+        // would our rewrite change anything we don't mean to? (data only, whitespace ignored)
+        let norm = |t: &str| t.split_whitespace().collect::<String>();
+        let mut files = vec![loginusers_path().unwrap(), config_vdf_path().unwrap()];
+        files.extend(store.iter().filter_map(|a| localconfig_path(&a.steamid)).filter(|p| p.exists()));
+        for f in files {
+            let t = fs::read_to_string(&f).unwrap();
+            let same = norm(&vdf::serialize(&vdf::parse(&t).unwrap())) == norm(&t);
+            println!("roundtrip unchanged ({}): {same}", f.file_name().unwrap().to_string_lossy());
+            if !same {
+                let (x, y) = (norm(&t), norm(&vdf::serialize(&vdf::parse(&t).unwrap())));
+                let i = x.chars().zip(y.chars()).position(|(p, q)| p != q).unwrap_or(0);
+                // mask letters/digits so nothing personal is printed
+                let mask = |s: &str| s.chars().skip(i.saturating_sub(20)).take(50).map(|c| if c.is_alphanumeric() { 'x' } else { c }).collect::<String>();
+                println!("  orig: {}
+  ours: {}
+  len {} vs {}", mask(&x), mask(&y), x.len(), y.len());
+            }
+        }
+        if let Some(a) = store.first() {
+            let info = profile::fetch_profile(&a.steamid).expect("profile fetch");
+            println!("profile xml ok: found={} state_present={}", info.found, !info.online_state.is_empty());
+        }
     }
 }

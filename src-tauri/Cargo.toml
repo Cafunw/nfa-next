@@ -1,6 +1,6 @@
 [package]
 name = "nfa-next"
-version = "1.2.0"
+version = "1.2.1"
 description = "NFA Next — a beautiful Steam account switcher"
 authors = ["NFA Next"]
 edition = "2021"

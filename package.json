@@ -1,6 +1,6 @@
 {
   "name": "nfa-next",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "NFA Next — a beautiful Steam account switcher",
   "scripts": {
