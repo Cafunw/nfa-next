@@ -468,3 +468,13 @@ kbd {
 .update-bar .upd-x { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; color: var(--muted); }
 .update-bar .upd-x:hover { background: rgba(255,255,255,.07); color: var(--text); }
 .update-bar .upd-x svg { width: 12px; height: 12px; }
+
+/* ---------- v1.2: presence ---------- */
+.presence { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11.5px; color: var(--dim); min-width: 0; }
+.presence span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.presence i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex-shrink: 0; }
+.presence.online { color: #93c5fd; }
+.presence.online i { background: #60a5fa; }
+.presence.in-game { color: #bef264; }
+.presence.in-game i { background: #a3e635; box-shadow: 0 0 0 3px rgba(163,230,53,.18); }
+.field select.select { width: 100%; height: 40px; }

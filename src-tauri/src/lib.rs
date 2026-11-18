@@ -55,6 +55,14 @@ pub struct Account {
     pub cooldown_until: u64,
     pub cooldown_reason: String,
 
+    /// live presence from the public profile: "online", "offline", "in-game"
+    pub online_state: String,
+    pub game_name: String,
+
+    /// game to start after switching (Steam app id) and its launch options
+    pub launch_appid: String,
+    pub launch_args: String,
+
     /// "" (normal), "invisible" or "offline"
     pub login_mode: String,
     /// We set this account to invisible earlier and should restore it.
@@ -400,8 +408,16 @@ fn switch_impl(steamid: String, mode: Option<String>) -> Result<String, String> 
     }
 
     launch_steam()?;
+    let mut urls = Vec::new();
     if mode == "invisible" {
-        nudge_status_later(acc.account_name.clone(), "invisible");
+        urls.push("steam://friends/status/invisible".to_string());
+    }
+    if !acc.launch_appid.is_empty() && acc.launch_appid.chars().all(|c| c.is_ascii_digit()) {
+        // steam://run/<appid>//<launch options>/
+        urls.push(format!("steam://run/{}//{}/", acc.launch_appid, acc.launch_args.trim().replace('/', "")));
+    }
+    if !urls.is_empty() {
+        after_steam_ready(acc.account_name.clone(), urls);
     }
 
     modify_store(|store| {
@@ -451,9 +467,9 @@ fn set_persona_state(steamid64: &str, state: u8) -> Result<(), String> {
     fs::write(&p, vdf::serialize(&root)).map_err(|e| e.to_string())
 }
 
-/// Once Steam is up, ask it for the status via steam:// as a fallback for the
-/// file edit above. Skipped if the user switched to another account meanwhile.
-fn nudge_status_later(account_name: String, status: &'static str) {
+/// Once Steam is up, open steam:// URLs (invisible status fallback, game launch).
+/// Skipped if the user switched to another account meanwhile.
+fn after_steam_ready(account_name: String, urls: Vec<String>) {
     std::thread::spawn(move || {
         for _ in 0..60 {
             if is_running("steamwebhelper.exe") {
@@ -462,12 +478,165 @@ fn nudge_status_later(account_name: String, status: &'static str) {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
         std::thread::sleep(std::time::Duration::from_secs(15));
-        if active_account_name().eq_ignore_ascii_case(&account_name) && is_running("steam.exe") {
-            let _ = cmd("explorer.exe")
-                .arg(format!("steam://friends/status/{status}"))
-                .spawn();
+        for url in urls {
+            if !(active_account_name().eq_ignore_ascii_case(&account_name) && is_running("steam.exe")) {
+                return;
+            }
+            // explorer.exe hands the URL to the (non-elevated) Steam
+            let _ = cmd("explorer.exe").arg(&url).spawn();
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
     });
+}
+
+// ---------- installed games ----------
+
+#[derive(Serialize)]
+struct Game {
+    appid: String,
+    name: String,
+}
+
+/// Installed games from every Steam library (steamapps/appmanifest_*.acf).
+#[tauri::command]
+async fn list_games() -> Vec<Game> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(sp) = steam_path() else { return vec![] };
+        let mut libs = vec![sp.clone()];
+        if let Ok(t) = fs::read_to_string(sp.join("steamapps").join("libraryfolders.vdf")) {
+            if let Ok(v) = vdf::parse(&t) {
+                for (_, lib) in v.get("libraryfolders").and_then(|l| l.obj()).into_iter().flatten() {
+                    if let Some(p) = lib.get_str("path") {
+                        libs.push(PathBuf::from(p.replace("\\\\", "\\")));
+                    }
+                }
+            }
+        }
+        let mut games: Vec<Game> = Vec::new();
+        for lib in libs {
+            let Ok(dir) = fs::read_dir(lib.join("steamapps")) else { continue };
+            for e in dir.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !(name.starts_with("appmanifest_") && name.ends_with(".acf")) {
+                    continue;
+                }
+                let Some(v) = fs::read_to_string(e.path()).ok().and_then(|t| vdf::parse(&t).ok()) else { continue };
+                let Some(app) = v.get("AppState") else { continue };
+                let (Some(id), Some(n)) = (app.get_str("appid"), app.get_str("name")) else { continue };
+                // skip redistributables / tools
+                if n.contains("Redistributable") || n.starts_with("Steamworks") || n.contains("Proton") {
+                    continue;
+                }
+                if !games.iter().any(|g| g.appid == id) {
+                    games.push(Game { appid: id.to_string(), name: n.to_string() });
+                }
+            }
+        }
+        games.sort_by_key(|g| g.name.to_lowercase());
+        games
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// ---------- tray ----------
+
+#[derive(Deserialize)]
+struct TrayItem {
+    steamid: String,
+    label: String,
+    active: bool,
+}
+
+/// Rebuild the tray menu. The UI sends the (already sorted, translated) entries.
+#[tauri::command]
+fn refresh_tray(app: AppHandle, items: Vec<TrayItem>, show: String, quit: String) -> Result<(), String> {
+    use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+    let menu = Menu::new(&app).map_err(|e| e.to_string())?;
+    for it in items.iter().take(20) {
+        let item = CheckMenuItem::with_id(&app, format!("sw:{}", it.steamid), &it.label, true, it.active, None::<&str>)
+            .map_err(|e| e.to_string())?;
+        menu.append(&item).map_err(|e| e.to_string())?;
+    }
+    if !items.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    }
+    menu.append(&MenuItem::with_id(&app, "show", show, true, None::<&str>).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    menu.append(&MenuItem::with_id(&app, "quit", quit, true, None::<&str>).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn show_main(app: &AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::Emitter;
+    let mut b = TrayIconBuilder::with_id("main")
+        .tooltip("NFA Next")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, e| match e.id().as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            id => {
+                if let Some(sid) = id.strip_prefix("sw:") {
+                    let _ = app.emit("tray-switch", sid.to_string());
+                }
+            }
+        })
+        .on_tray_icon_event(|tray, e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        b = b.icon(icon.clone());
+    }
+    b.build(app)?;
+    Ok(())
+}
+
+// ---------- autostart (Task Scheduler, so the admin app starts without a UAC prompt) ----------
+
+const TASK_NAME: &str = "NFA Next";
+
+#[tauri::command]
+fn get_autostart() -> bool {
+    cmd("schtasks").args(["/Query", "/TN", TASK_NAME]).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    let out = if enabled {
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut c = cmd("schtasks");
+        // raw_arg: schtasks wants the nested quotes exactly like this
+        c.args(["/Create", "/F", "/SC", "ONLOGON", "/RL", "HIGHEST", "/TN", TASK_NAME, "/TR"]);
+        #[cfg(windows)]
+        c.raw_arg(format!("\"\\\"{}\\\" --minimized\"", exe.display()));
+        c.output()
+    } else {
+        cmd("schtasks").args(["/Delete", "/F", "/TN", TASK_NAME]).output()
+    }
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 // ---------- commands: token ----------
@@ -551,6 +720,8 @@ pub struct AccountEdit {
     pub cooldown_until: Option<u64>,
     pub cooldown_reason: Option<String>,
     pub login_mode: Option<String>,
+    pub launch_appid: Option<String>,
+    pub launch_args: Option<String>,
 }
 
 #[tauri::command]
@@ -580,6 +751,12 @@ fn update_account(edit: AccountEdit) -> Result<(), String> {
         }
         if let Some(v) = edit.cooldown_reason {
             a.cooldown_reason = v;
+        }
+        if let Some(v) = edit.launch_appid {
+            a.launch_appid = v.chars().filter(|c| c.is_ascii_digit()).collect();
+        }
+        if let Some(v) = edit.launch_args {
+            a.launch_args = v;
         }
         if let Some(v) = edit.login_mode {
             a.login_mode = match v.as_str() {
@@ -657,22 +834,27 @@ async fn refresh_profiles(force: bool) -> Result<Vec<Account>, String> {
 }
 
 fn refresh_profiles_impl(force: bool) -> Result<Vec<Account>, String> {
-    let due: Vec<String> = load_store()
+    // presence is live, so every account is fetched; avatars only when stale
+    let due: Vec<(String, bool)> = load_store()
         .into_iter()
-        .filter(|a| force || now().saturating_sub(a.profile_checked) > PROFILE_TTL)
-        .map(|a| a.steamid)
+        .map(|a| {
+            let stale = force
+                || now().saturating_sub(a.profile_checked) > PROFILE_TTL
+                || !profile::avatar_dir().join(format!("{}.jpg", a.steamid)).exists();
+            (a.steamid, stale)
+        })
         .collect();
 
     // network work happens outside the store lock
     let mut results: Vec<(String, profile::ProfileInfo)> = Vec::new();
     let mut failures = 0;
-    for (i, sid) in due.iter().enumerate() {
+    for (i, (sid, stale)) in due.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(400)); // be polite
         }
         match profile::fetch_profile(sid) {
             Ok(info) => {
-                if info.found && !info.avatar_url.is_empty() {
+                if *stale && info.found && !info.avatar_url.is_empty() {
                     let _ = profile::download_avatar(sid, &info.avatar_url);
                 }
                 results.push((sid.clone(), info));
@@ -689,6 +871,8 @@ fn refresh_profiles_impl(force: bool) -> Result<Vec<Account>, String> {
             if let Some(a) = store.iter_mut().find(|a| a.steamid == *sid) {
                 a.profile_checked = now();
                 a.profile_found = info.found;
+                a.online_state = info.online_state.clone();
+                a.game_name = info.game_name.clone();
                 if info.found {
                     a.vac_banned = info.vac_banned;
                     a.trade_ban = info.trade_ban.clone();
@@ -730,6 +914,8 @@ struct BackupAccount {
     cooldown_until: u64,
     cooldown_reason: String,
     login_mode: String,
+    launch_appid: String,
+    launch_args: String,
 }
 
 #[derive(Serialize)]
@@ -777,6 +963,8 @@ async fn export_backup(app: AppHandle) -> Result<Option<String>, String> {
                     cooldown_until: a.cooldown_until,
                     cooldown_reason: a.cooldown_reason,
                     login_mode: a.login_mode,
+                    launch_appid: a.launch_appid,
+                    launch_args: a.launch_args,
                 })
                 .collect(),
         };
@@ -843,6 +1031,8 @@ fn merge_backup(items: Vec<BackupAccount>) -> Result<ImportResult, String> {
             a.cooldown_until = b.cooldown_until;
             a.cooldown_reason = b.cooldown_reason;
             a.login_mode = b.login_mode;
+            a.launch_appid = b.launch_appid;
+            a.launch_args = b.launch_args;
         }
         Ok((added, updated, store.clone()))
     })?;
@@ -1028,6 +1218,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            use tauri::Manager;
+            build_tray(app.handle())?;
+            // started by the logon task: stay in the tray
+            if std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_status,
             capture_accounts,
@@ -1043,6 +1244,10 @@ pub fn run() {
             import_backup,
             check_update,
             install_update,
+            list_games,
+            refresh_tray,
+            get_autostart,
+            set_autostart,
             stop_steam_cmd,
             open_steam
         ])

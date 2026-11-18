@@ -17,6 +17,9 @@ pub struct ProfileInfo {
     pub limited: bool,
     pub privacy: String,
     pub avatar_url: String,
+    /// "online", "offline" or "in-game"
+    pub online_state: String,
+    pub game_name: String,
 }
 
 fn agent() -> ureq::Agent {
@@ -53,6 +56,10 @@ pub fn parse_profile_xml(xml: &str) -> ProfileInfo {
         limited: flag("isLimitedAccount"),
         privacy: xml_tag(xml, "privacyState").unwrap_or_default(),
         avatar_url: xml_tag(xml, "avatarFull").unwrap_or_default(),
+        online_state: xml_tag(xml, "onlineState").unwrap_or_default(),
+        game_name: xml_tag(xml, "inGameInfo")
+            .and_then(|g| xml_tag(&g, "gameName"))
+            .unwrap_or_default(),
     }
 }
 
@@ -131,6 +138,8 @@ mod tests {
 	<steamID64>76561198000000001</steamID64>
 	<steamID><![CDATA[Ünlü Oyuncu]]></steamID>
 	<privacyState>public</privacyState>
+	<onlineState>in-game</onlineState>
+	<inGameInfo><gameName><![CDATA[Counter-Strike 2]]></gameName></inGameInfo>
 	<vacBanned>1</vacBanned>
 	<tradeBanState>None</tradeBanState>
 	<isLimitedAccount>0</isLimitedAccount>
@@ -145,6 +154,8 @@ mod tests {
         assert_eq!(p.trade_ban, "None");
         assert_eq!(p.privacy, "public");
         assert_eq!(p.avatar_url, "https://avatars.steamstatic.com/abc_full.jpg");
+        assert_eq!(p.online_state, "in-game");
+        assert_eq!(p.game_name, "Counter-Strike 2");
     }
 
     #[test]

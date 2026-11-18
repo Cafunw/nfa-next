@@ -40,6 +40,7 @@ const isActive = (a) => a.account_name && a.account_name.toLowerCase() === (stat
 const onCooldown = (a) => a.cooldown_until > now();
 const isBanned = (a) => a.vac_banned || (a.trade_ban && a.trade_ban !== "None");
 const onlineLookups = () => store.get("onlineLookups") !== "0";
+const closeToTray = () => store.get("closeToTray") !== "0";
 const fmtDate = (ts) => new Date(ts * 1000).toLocaleDateString(locale());
 function ago(ts) {
   if (!ts) return t("never");
@@ -113,13 +114,14 @@ async function update(steamid, patch) {
     render();
   } catch (e) { toast(String(e), "err"); }
 }
-let refreshing = false;
+let refreshing = false, avatarsFetched = false;
 async function refreshProfiles(force = false) {
   if (!onlineLookups() || !state.accounts.length || refreshing) return;
   refreshing = true;
   try {
     state.accounts = await invoke("refresh_profiles", { force });
-    await loadAvatars();
+    // avatars only change on the first pass or a forced refresh
+    if (force || !avatarsFetched) { avatarsFetched = true; await loadAvatars(); } else render();
     if (force) toast(t("profilesRefreshed"));
   } catch (e) { if (force) toast(String(e), "err"); }
   refreshing = false;
@@ -164,9 +166,10 @@ function renderStatus() {
   });
 }
 
-function visibleAccounts() {
-  const q = state.query.trim().toLocaleLowerCase(locale());
+function visibleAccounts(all = false) {
+  const q = all ? "" : state.query.trim().toLocaleLowerCase(locale());
   const list = state.accounts.filter((a) => {
+    if (all) return true;
     if (state.filter === "fav" && !a.favorite) return false;
     if (state.filter === "cd" && !onCooldown(a)) return false;
     if (state.filter === "ban" && !isBanned(a)) return false;
@@ -215,6 +218,13 @@ function badgesHTML(a) {
   return b.length ? `<div class="badges">${b.join("")}</div>` : "";
 }
 
+function presenceHTML(a) {
+  if (!onlineLookups() || !a.online_state) return "";
+  const st = a.online_state === "in-game" ? "in-game" : a.online_state === "online" ? "online" : "offline";
+  const label = st === "in-game" ? (a.game_name ? t("inGameNamed", { g: a.game_name }) : t("inGame")) : t(st === "online" ? "presOnline" : "presOffline");
+  return `<div class="presence ${st}" title="${esc(t("presenceTitle"))}"><i></i><span>${esc(label)}</span></div>`;
+}
+
 function cooldownHTML(a) {
   if (!onCooldown(a)) return "";
   const until = new Date(a.cooldown_until * 1000).toLocaleString(locale());
@@ -233,6 +243,7 @@ function cardHTML(a, i) {
       <div class="who">
         <div class="name" title="${esc(nameOf(a))}">${esc(nameOf(a))}</div>
         <div class="login">@${esc(a.account_name)}</div>
+        ${presenceHTML(a)}
       </div>
       <button class="star ${a.favorite ? "on" : ""}" data-act="fav" title="${esc(t("favorite"))}">${ICON.star}</button>
       <button class="more" data-act="menu" title="${esc(t("more"))}">${ICON.more}</button>
@@ -262,6 +273,17 @@ function render() {
   $("#statTotal").textContent = state.accounts.length;
   $("#statFav").textContent = state.accounts.filter((a) => a.favorite).length;
   renderStatus();
+  syncTray();
+}
+
+// tray menu mirrors the list; only rebuilt when it actually changes
+let traySig = "";
+function syncTray() {
+  const items = visibleAccounts(true).map((a) => ({ steamid: a.steamid, label: nameOf(a) + (a.login_mode ? ` (${t(a.login_mode === "invisible" ? "modeInvisible" : "modeOffline")})` : ""), active: !!isActive(a) }));
+  const sig = JSON.stringify([items, LANG]);
+  if (sig === traySig) return;
+  traySig = sig;
+  invoke("refresh_tray", { items, show: t("trayShow"), quit: t("trayQuit") }).catch(() => {});
 }
 
 // ---------- switching ----------
@@ -292,6 +314,7 @@ async function switchTo(steamid, mode) {
     state.status.active_user = a.account_name;
     toast(t("switched", { name: nameOf(a) }), "ok");
     if (onCooldown(a)) toast(t("cdStill", { left: fmtLeft(a.cooldown_until - now()) }), "info");
+    if (store.get("hideAfterSwitch") === "1") appWin.hide();
     await new Promise((r) => setTimeout(r, 350));
   } catch (e) {
     clearInterval(timer);
@@ -332,6 +355,10 @@ function editModal(a) {
     <div class="field"><label>${esc(t("loginMode"))}</label>
       <div class="seg wide" id="fMode">${modes.map(([k, l]) => `<button class="${mode === k ? "on" : ""}" data-m="${k}">${esc(t(l))}</button>`).join("")}</div>
       <span class="hint" id="fModeHint"></span></div>
+    <div class="field"><label>${esc(t("launchGame"))}</label>
+      <div class="row"><select id="fGame" class="select"><option value="">${esc(t("launchNone"))}</option>${a.launch_appid ? `<option value="${esc(a.launch_appid)}" selected>${esc(a.launch_appid)}</option>` : ""}</select>
+      <input id="fArgs" maxlength="200" spellcheck="false" placeholder="${esc(t("launchArgsPh"))}" value="${esc(a.launch_args)}"/></div>
+      <span class="hint">${esc(t("launchHint"))}</span></div>
     <div class="field"><label>${esc(t("cooldown"))}</label>
       <div class="cd-presets" id="fCdPresets">${presets.map(([s, l]) => `<button class="chip" data-s="${s}">${esc(t(l))}</button>`).join("")}<button class="chip" data-s="0">${esc(t("cdClear"))}</button></div>
       <div class="row"><input id="fCdUntil" type="datetime-local"/><input id="fCdReason" maxlength="40" placeholder="${esc(t("cdReasonPh"))}" value="${esc(a.cooldown_reason)}"/></div></div>
@@ -362,6 +389,13 @@ function editModal(a) {
       m.querySelectorAll("#fMode button").forEach((x) => x.classList.toggle("on", x === b));
       setHint();
     };
+    const gameSel = m.querySelector("#fGame");
+    invoke("list_games").then((games) => {
+      const cur = a.launch_appid;
+      gameSel.innerHTML = `<option value="">${esc(t("launchNone"))}</option>` +
+        games.map((g) => `<option value="${esc(g.appid)}" ${g.appid === cur ? "selected" : ""}>${esc(g.name)}</option>`).join("") +
+        (cur && !games.some((g) => g.appid === cur) ? `<option value="${esc(cur)}" selected>${esc(t("appId", { id: cur }))}</option>` : "");
+    }).catch(() => {});
     const cdInput = m.querySelector("#fCdUntil"), cdReason = m.querySelector("#fCdReason");
     const toLocal = (ts) => { const d = new Date(ts * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
     if (onCooldown(a)) cdInput.value = toLocal(a.cooldown_until);
@@ -376,7 +410,7 @@ function editModal(a) {
       const live = until > now();
       await update(a.steamid, {
         nickname: m.querySelector("#fNick").value.trim(), note: m.querySelector("#fNote").value.trim(), tags: [...tags], color,
-        login_mode: mode, cooldown_until: live ? until : 0, cooldown_reason: live ? cdReason.value.trim() : "",
+        login_mode: mode, launch_appid: gameSel.value, launch_args: m.querySelector("#fArgs").value.trim(), cooldown_until: live ? until : 0, cooldown_reason: live ? cdReason.value.trim() : "",
       });
       a._cdToasted = false;
       closeModal(); toast(t("saved"));
@@ -452,6 +486,9 @@ function settingsModal() {
       ${row("backup", "backupSub", `<button class="btn ghost" id="sExport">${esc(t("export"))}</button><button class="btn ghost" id="sImport">${esc(t("import"))}</button>`)}
       ${row("updates", "updatesSub", `<button class="btn ghost" id="sUpd">${esc(t("checkNow"))}</button>${toggle("sAutoUpd", store.get("autoUpdate") !== "0")}`, "sVer")}
       ${row("autoCapture", "autoCaptureSub", toggle("sAuto", store.get("autoCapture") !== "0"))}
+      ${row("closeToTray", "closeToTraySub", toggle("sTray", closeToTray()))}
+      ${row("hideAfterSwitch", "hideAfterSwitchSub", toggle("sHide", store.get("hideAfterSwitch") === "1"))}
+      ${row("autostart", "autostartSub", toggle("sBoot", false))}
       ${row("startSteam", "startSteamSub", `<button class="btn ghost" id="sOpen">${esc(t("start"))}</button>`)}
       ${row("stopSteam", "stopSteamSub", `<button class="btn ghost" id="sStop">${esc(t("stop"))}</button>`)}
       ${row("clearAll", "clearAllSub", `<button class="btn danger" id="sClear">${esc(t("clear"))}</button>`)}
@@ -480,6 +517,14 @@ function settingsModal() {
     m.querySelector("#sUpd").onclick = (e) => busy(e.currentTarget, () => checkUpdate(true));
     m.querySelector("#sAutoUpd").onchange = (e) => store.set("autoUpdate", e.target.checked ? "1" : "0");
     m.querySelector("#sAuto").onchange = (e) => store.set("autoCapture", e.target.checked ? "1" : "0");
+    m.querySelector("#sTray").onchange = (e) => store.set("closeToTray", e.target.checked ? "1" : "0");
+    m.querySelector("#sHide").onchange = (e) => store.set("hideAfterSwitch", e.target.checked ? "1" : "0");
+    const boot = m.querySelector("#sBoot");
+    invoke("get_autostart").then((on) => (boot.checked = on)).catch(() => {});
+    boot.onchange = async () => {
+      try { await invoke("set_autostart", { enabled: boot.checked }); toast(t(boot.checked ? "autostartOn" : "autostartOff")); }
+      catch (e) { boot.checked = !boot.checked; toast(String(e), "err"); }
+    };
     m.querySelector("#sOpen").onclick = async () => { try { await invoke("open_steam"); toast(t("steamStarting")); setTimeout(refreshStatus, 2500); } catch (e) { toast(String(e), "err"); } };
     m.querySelector("#sStop").onclick = (e) => busy(e.currentTarget, async () => { try { await invoke("stop_steam_cmd"); toast(t("steamStopped")); refreshStatus(); } catch (err) { toast(String(err), "err"); } });
     m.querySelector("#sClear").onclick = () => openModal(`
@@ -506,6 +551,8 @@ function openMenu(a, x, y) {
     <button data-m="edit">${ICON.edit} ${esc(t("mEdit"))}</button>
     <button data-m="copy">${ICON.copy} ${esc(t("mCopyId"))}</button>
     <button data-m="copyName">${ICON.copy} ${esc(t("mCopyName"))}</button>
+    <button data-m="copyLink">${ICON.copy} ${esc(t("mCopyLink"))}</button>
+    <button data-m="copyCode">${ICON.copy} ${esc(t("mCopyCode"))}</button>
     <button data-m="profile">${ICON.link} ${esc(t("mProfile"))}</button>
     <hr/><button data-m="remove" class="danger">${ICON.trash} ${esc(t("remove"))}</button>`;
   menu.hidden = false;
@@ -523,6 +570,8 @@ function openMenu(a, x, y) {
       edit: () => editModal(a),
       copy: () => copy(a.steamid, t("copiedId")),
       copyName: () => copy(a.account_name, t("copiedName")),
+      copyLink: () => copy(`https://steamcommunity.com/profiles/${a.steamid}`, t("copiedLink")),
+      copyCode: () => copy(String(BigInt(a.steamid) - 76561197960265728n), t("copiedCode")),
       profile: () => invoke("plugin:opener|open_url", { url: `https://steamcommunity.com/profiles/${a.steamid}` }).catch((e) => toast(String(e), "err")),
       remove: () => removeModal(a),
     })[m]();
@@ -566,7 +615,8 @@ $("#modal").addEventListener("click", (e) => { if (e.target.closest("[data-close
 
 $("#winMin").onclick = () => appWin.minimize();
 $("#winMax").onclick = () => appWin.toggleMaximize();
-$("#winClose").onclick = () => appWin.close();
+$("#winClose").onclick = () => (closeToTray() ? appWin.hide() : appWin.close());
+T.event.listen("tray-switch", (e) => switchTo(e.payload));
 appWin.onResized(async () => $("#app").classList.toggle("maximized", await appWin.isMaximized()));
 
 document.addEventListener("keydown", (e) => {
@@ -604,6 +654,7 @@ setInterval(() => {
   loadAvatars();
   if (store.get("autoCapture") !== "0" && state.status.steam_found) await capture(true);
   setInterval(() => { if (!state.switching) refreshStatus(); }, 3000);
-  refreshProfiles(); // background; only accounts not checked in the last 6 h
+  refreshProfiles(); // presence for all, avatars/bans when stale
+  setInterval(() => { if (!state.switching) refreshProfiles(); }, 180000);
   if (store.get("autoUpdate") !== "0") setTimeout(checkUpdate, 4000);
 })();
