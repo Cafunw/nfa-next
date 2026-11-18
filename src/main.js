@@ -25,6 +25,7 @@ const state = {
   switching: false,
   avatars: {},
   update: null,
+  view: store.get("view") || "grid",
 };
 
 // ---------- helpers ----------
@@ -41,6 +42,27 @@ const onCooldown = (a) => a.cooldown_until > now();
 const isBanned = (a) => a.vac_banned || (a.trade_ban && a.trade_ban !== "None");
 const onlineLookups = () => store.get("onlineLookups") !== "0";
 const closeToTray = () => store.get("closeToTray") !== "0";
+const streamerOn = () => store.get("streamer") === "1" || (store.get("streamerAuto") === "1" && state.status.obs_running);
+// names that go into toasts / overlay, which streamer-mode CSS can't blur
+const shownName = (a) => (streamerOn() ? t("hiddenName") : nameOf(a));
+const ACCENTS = ["#10b981", "#3b82f6", "#8b5cf6", "#ec4899", "#f59e0b", "#ef4444", "#06b6d4"];
+
+/** Apply appearance settings (accent, scale, motion, streamer mode, view). */
+function applyLook() {
+  const r = document.documentElement;
+  r.style.setProperty("--accent", store.get("accent") || ACCENTS[0]);
+  r.style.zoom = (+store.get("scale") || 100) / 100;
+  r.classList.toggle("reduce-motion", store.get("reduceMotion") === "1");
+  r.classList.toggle("streamer", !!streamerOn());
+  $("#streamerBadge").hidden = !streamerOn();
+  $("#grid").classList.toggle("list", state.view === "list");
+}
+function toggleView() { state.view = state.view === "list" ? "grid" : "list"; store.set("view", state.view); applyLook(); render(); }
+function toggleStreamer() {
+  const on = store.get("streamer") !== "1";
+  store.set("streamer", on ? "1" : "0"); applyLook(); render();
+  toast(t(on ? "streamerOnMsg" : "streamerOffMsg"), "info");
+}
 const fmtDate = (ts) => new Date(ts * 1000).toLocaleDateString(locale());
 function ago(ts) {
   if (!ts) return t("never");
@@ -157,6 +179,7 @@ function renderStatus() {
     : s.steam_running ? `${esc(t("steamOn"))}${s.active_user ? ` · <b>${esc(s.active_user)}</b>` : ""}`
     : esc(t("steamOff"));
   $("#footPath").textContent = s.steam_path || t("steamPathMissing");
+  applyLook();
   const act = state.accounts.find(isActive);
   $("#statActive").textContent = act ? nameOf(act) : (s.active_user || "—");
   // refresh active highlight without full re-render
@@ -182,6 +205,7 @@ function visibleAccounts(all = false) {
     name: cmp,
     recent: (x, y) => y.last_switch - x.last_switch,
     login: (x, y) => y.timestamp - x.timestamp,
+    custom: (x, y) => ((x.sort_order || 1e9) - (y.sort_order || 1e9)) || cmp(x, y),
     smart: (x, y) => (isActive(y) - isActive(x)) || (y.favorite - x.favorite) || (onCooldown(x) - onCooldown(y)) || (y.last_switch - x.last_switch) || cmp(x, y),
   }[state.sort] || cmp;
   return list.sort(by);
@@ -236,7 +260,7 @@ function cardHTML(a, i) {
   const active = isActive(a);
   const tags = a.tags.map((tg) => `<span class="tag" style="--tc:${TAG_COLORS[tg] || esc(a.color)}">${esc(tg)}</span>`).join("");
   return `
-  <article class="card ${active ? "active" : ""} ${onCooldown(a) ? "on-cd" : ""}" data-id="${esc(a.steamid)}" tabindex="0" style="--c:${esc(a.color || "#10b981")};animation-delay:${Math.min(i, 12) * 30}ms">
+  <article class="card ${active ? "active" : ""} ${onCooldown(a) ? "on-cd" : ""}" data-id="${esc(a.steamid)}" tabindex="0" draggable="true" style="--c:${esc(a.color || "#10b981")};animation-delay:${Math.min(i, 12) * 30}ms">
     ${i < 9 ? `<span class="quick">${i + 1}</span>` : ""}
     <div class="card-top">
       ${avatarHTML(a, active ? '<span class="online"></span>' : "")}
@@ -295,7 +319,7 @@ async function switchTo(steamid, mode) {
   const ov = $("#switchOverlay"), steps = [...document.querySelectorAll("#switchSteps li")];
   const m = mode ?? a.login_mode;
   $("#switchAvatar").innerHTML = avatarHTML(a);
-  $("#switchTitle").textContent = t(m === "invisible" ? "switchingInvisible" : m === "offline" ? "switchingOffline" : "switchingTo", { name: nameOf(a) });
+  $("#switchTitle").textContent = t(m === "invisible" ? "switchingInvisible" : m === "offline" ? "switchingOffline" : "switchingTo", { name: shownName(a) });
   steps.forEach((s) => (s.className = ""));
   ov.hidden = false;
 
@@ -312,7 +336,7 @@ async function switchTo(steamid, mode) {
     mark(3);
     a.last_switch = now();
     state.status.active_user = a.account_name;
-    toast(t("switched", { name: nameOf(a) }), "ok");
+    toast(t("switched", { name: shownName(a) }), "ok");
     if (onCooldown(a)) toast(t("cdStill", { left: fmtLeft(a.cooldown_until - now()) }), "info");
     if (store.get("hideAfterSwitch") === "1") appWin.hide();
     await new Promise((r) => setTimeout(r, 350));
@@ -480,15 +504,25 @@ function settingsModal() {
   openModal(`
     <h2>${esc(t("settings"))}</h2>
     <p class="sub">${s.steam_found ? esc(t("steamAt", { p: s.steam_path })) : esc(t("steamMissing"))}</p>
-    <div style="margin-top:6px">
+    <div class="search set-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="sSearch" placeholder="${esc(t("settingsSearchPh"))}" spellcheck="false"/></div>
+    <div id="sRows">
+      <h3 class="set-h">${esc(t("secLook"))}</h3>
       ${row("language", "languageSub", `<div class="seg" id="sLang">${Object.entries(LANGS).map(([k, label]) => `<button class="${k === LANG ? "on" : ""}" data-l="${k}">${label}</button>`).join("")}</div>`)}
+      ${row("accent", "accentSub", `<div class="swatches" id="sAccent">${ACCENTS.map((c) => `<button class="swatch ${c === (store.get("accent") || ACCENTS[0]) ? "sel" : ""}" data-c="${c}" style="--c:${c}"></button>`).join("")}</div>`)}
+      ${row("uiScale", "uiScaleSub", `<div class="seg" id="sScale">${[90, 100, 110, 125].map((v) => `<button class="${v === (+store.get("scale") || 100) ? "on" : ""}" data-v="${v}">${v}%</button>`).join("")}</div>`)}
+      ${row("reduceMotion", "reduceMotionSub", toggle("sMotion", store.get("reduceMotion") === "1"))}
+      ${row("streamerMode", "streamerModeSub", toggle("sStreamer", store.get("streamer") === "1"))}
+      ${row("streamerAuto", "streamerAutoSub", toggle("sStreamerAuto", store.get("streamerAuto") === "1"))}
+      <h3 class="set-h">${esc(t("secData"))}</h3>
       ${row("onlineLookups", "onlineLookupsSub", `<button class="btn ghost" id="sRefresh">${ICON.refresh} ${esc(t("refreshNow"))}</button>${toggle("sOnline", onlineLookups())}`)}
       ${row("backup", "backupSub", `<button class="btn ghost" id="sExport">${esc(t("export"))}</button><button class="btn ghost" id="sImport">${esc(t("import"))}</button>`)}
       ${row("updates", "updatesSub", `<button class="btn ghost" id="sUpd">${esc(t("checkNow"))}</button>${toggle("sAutoUpd", store.get("autoUpdate") !== "0")}`, "sVer")}
+      <h3 class="set-h">${esc(t("secBehavior"))}</h3>
       ${row("autoCapture", "autoCaptureSub", toggle("sAuto", store.get("autoCapture") !== "0"))}
       ${row("closeToTray", "closeToTraySub", toggle("sTray", closeToTray()))}
       ${row("hideAfterSwitch", "hideAfterSwitchSub", toggle("sHide", store.get("hideAfterSwitch") === "1"))}
       ${row("autostart", "autostartSub", toggle("sBoot", false))}
+      <h3 class="set-h">Steam</h3>
       ${row("startSteam", "startSteamSub", `<button class="btn ghost" id="sOpen">${esc(t("start"))}</button>`)}
       ${row("stopSteam", "stopSteamSub", `<button class="btn ghost" id="sStop">${esc(t("stop"))}</button>`)}
       ${row("clearAll", "clearAllSub", `<button class="btn danger" id="sClear">${esc(t("clear"))}</button>`)}
@@ -496,6 +530,24 @@ function settingsModal() {
     <div class="modal-actions"><button class="btn ghost" data-close>${esc(t("closeBtn"))}</button></div>`,
   (m) => {
     const busy = async (btn, fn) => { btn.disabled = true; try { await fn(); } finally { btn.disabled = false; } };
+    m.querySelector("#sSearch").oninput = (e) => {
+      const q = e.target.value.trim().toLocaleLowerCase(locale());
+      m.querySelectorAll("#sRows .set-row").forEach((r) => (r.hidden = !!q && !r.textContent.toLocaleLowerCase(locale()).includes(q)));
+      m.querySelectorAll("#sRows .set-h").forEach((h) => (h.hidden = !!q));
+    };
+    m.querySelector("#sAccent").onclick = (e) => {
+      const b = e.target.closest(".swatch"); if (!b) return;
+      store.set("accent", b.dataset.c); applyLook();
+      m.querySelectorAll("#sAccent .swatch").forEach((x) => x.classList.toggle("sel", x === b));
+    };
+    m.querySelector("#sScale").onclick = (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      store.set("scale", b.dataset.v); applyLook();
+      m.querySelectorAll("#sScale button").forEach((x) => x.classList.toggle("on", x === b));
+    };
+    m.querySelector("#sMotion").onchange = (e) => { store.set("reduceMotion", e.target.checked ? "1" : "0"); applyLook(); };
+    m.querySelector("#sStreamer").onchange = (e) => { store.set("streamer", e.target.checked ? "1" : "0"); applyLook(); render(); };
+    m.querySelector("#sStreamerAuto").onchange = (e) => { store.set("streamerAuto", e.target.checked ? "1" : "0"); applyLook(); };
     m.querySelector("#sLang").onclick = (e) => {
       const l = e.target.closest("button")?.dataset.l;
       if (!l || l === LANG) return;
@@ -610,6 +662,73 @@ $("#emptyCapture").onclick = () => capture();
 $("#btnAddToken").onclick = tokenModal;
 $("#emptyToken").onclick = tokenModal;
 $("#btnSettings").onclick = settingsModal;
+$("#btnView").onclick = toggleView;
+
+// ---------- drag & drop reorder ----------
+let dragId = null;
+const clearDrop = () => document.querySelectorAll(".drop-before,.drop-after").forEach((x) => x.classList.remove("drop-before", "drop-after"));
+$("#grid").addEventListener("dragstart", (e) => {
+  const c = e.target.closest(".card"); if (!c) return;
+  dragId = c.dataset.id; c.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", dragId);
+});
+$("#grid").addEventListener("dragend", () => { dragId = null; clearDrop(); document.querySelectorAll(".dragging").forEach((x) => x.classList.remove("dragging")); });
+$("#grid").addEventListener("dragover", (e) => {
+  const c = e.target.closest(".card");
+  if (!dragId || !c || c.dataset.id === dragId) return;
+  e.preventDefault();
+  const r = c.getBoundingClientRect();
+  const after = state.view === "list" ? e.clientY > r.top + r.height / 2 : e.clientX > r.left + r.width / 2;
+  clearDrop(); c.classList.add(after ? "drop-after" : "drop-before");
+});
+$("#grid").addEventListener("drop", (e) => {
+  const c = e.target.closest(".card");
+  if (!dragId || !c || c.dataset.id === dragId) return;
+  e.preventDefault();
+  const ids = visibleAccounts().map((a) => a.steamid).filter((id) => id !== dragId);
+  ids.splice(ids.indexOf(c.dataset.id) + (c.classList.contains("drop-after") ? 1 : 0), 0, dragId);
+  const order = [...ids, ...visibleAccounts(true).map((a) => a.steamid).filter((id) => !ids.includes(id))];
+  order.forEach((id, n) => { const a = state.accounts.find((x) => x.steamid === id); if (a) a.sort_order = n + 1; });
+  if (state.sort !== "custom") { state.sort = "custom"; store.set("sort", "custom"); $("#sort").value = "custom"; }
+  render();
+  invoke("reorder", { ids: order }).catch((err) => toast(String(err), "err"));
+});
+
+// ---------- command palette (Ctrl+K) ----------
+let palSel = 0, palItems = [];
+function paletteItems(q) {
+  q = q.trim().toLocaleLowerCase(locale());
+  const acc = visibleAccounts(true).map((a) => ({ a, label: nameOf(a), sub: "@" + a.account_name, run: (shift) => switchTo(a.steamid, shift ? "invisible" : undefined) }));
+  const cmds = [["capture", () => capture()], ["addToken", tokenModal], ["settings", settingsModal], ["paletteView", toggleView], ["paletteStreamer", toggleStreamer]]
+    .map(([k, run]) => ({ label: t(k), sub: "", run }));
+  const hay = (i) => [i.label, i.sub, ...(i.a ? [i.a.steamid, i.a.persona, i.a.note, ...i.a.tags] : [])].join(" ").toLocaleLowerCase(locale());
+  return [...acc, ...cmds].filter((i) => !q || hay(i).includes(q));
+}
+function renderPalette() {
+  palItems = paletteItems($("#palInput").value);
+  palSel = Math.max(0, Math.min(palSel, palItems.length - 1));
+  $("#palList").innerHTML = palItems.length ? palItems.map((it, i) => `
+    <button class="pal-item ${i === palSel ? "sel" : ""}" data-i="${i}">
+      ${it.a ? avatarHTML(it.a) : `<span class="pal-ic">${ICON.bolt}</span>`}
+      <span class="pi-text"><span class="pi-name">${esc(it.label)}</span>${it.sub ? `<small>${esc(it.sub)}</small>` : ""}</span>
+      ${it.a && isActive(it.a) ? `<span class="badge ok">${esc(t("activeAccount"))}</span>` : ""}
+    </button>`).join("") : `<p class="pal-empty">${esc(t("noMatch", { q: $("#palInput").value }))}</p>`;
+  $("#palList .sel")?.scrollIntoView({ block: "nearest" });
+}
+function openPalette() {
+  if (!$("#modalBackdrop").hidden || !$("#switchOverlay").hidden) return;
+  palSel = 0; $("#palInput").value = ""; $("#palette").hidden = false; renderPalette(); $("#palInput").focus();
+}
+const closePalette = () => ($("#palette").hidden = true);
+function runPalette(i, shift) { const it = palItems[i]; if (!it) return; closePalette(); it.run(shift); }
+$("#palInput").oninput = () => { palSel = 0; renderPalette(); };
+$("#palInput").onkeydown = (e) => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); palSel += e.key === "ArrowDown" ? 1 : -1; renderPalette(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPalette(palSel, e.shiftKey); }
+};
+$("#palList").onclick = (e) => { const b = e.target.closest(".pal-item"); if (b) runPalette(+b.dataset.i, e.shiftKey); };
+$("#palette").addEventListener("mousedown", (e) => { if (e.target.id === "palette") closePalette(); });
 $("#modalBackdrop").addEventListener("mousedown", (e) => { if (e.target.id === "modalBackdrop") closeModal(); });
 $("#modal").addEventListener("click", (e) => { if (e.target.closest("[data-close]")) closeModal(); });
 
@@ -620,7 +739,10 @@ T.event.listen("tray-switch", (e) => switchTo(e.payload));
 appWin.onResized(async () => $("#app").classList.toggle("maximized", await appWin.isMaximized()));
 
 document.addEventListener("keydown", (e) => {
-  const typing = e.target.closest("input,textarea,select");
+  const typing = e.target.closest?.("input,textarea,select");
+  if (e.ctrlKey && e.key.toLowerCase() === "k") { e.preventDefault(); $("#palette").hidden ? openPalette() : closePalette(); return; }
+  if (e.key === "Escape" && !$("#palette").hidden) { closePalette(); return; }
+  if (!$("#palette").hidden) return;
   if (e.key === "Escape") { $("#menu").hidden = true; if (!$("#modalBackdrop").hidden) closeModal(); else if (typing) e.target.blur(); return; }
   if (e.ctrlKey && e.key.toLowerCase() === "f") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
   if (e.ctrlKey && e.key.toLowerCase() === "r") { e.preventDefault(); capture(); refreshStatus(); return; }
@@ -641,7 +763,7 @@ setInterval(() => {
   if (!ended) return;
   state.accounts.filter((a) => a.cooldown_until && a.cooldown_until <= now() && !a._cdToasted).forEach((a) => {
     a._cdToasted = true;
-    toast(t("cdEnded", { name: nameOf(a) }), "info");
+    toast(t("cdEnded", { name: shownName(a) }), "info");
   });
   render();
 }, 1000);
@@ -649,6 +771,7 @@ setInterval(() => {
 // ---------- boot ----------
 (async () => {
   applyStatic();
+  applyLook();
   await refreshStatus();
   await loadAccounts();
   loadAvatars();

@@ -63,6 +63,9 @@ pub struct Account {
     pub launch_appid: String,
     pub launch_args: String,
 
+    /// position for the "custom" sort (drag & drop); 0 = never placed
+    pub sort_order: u32,
+
     /// "" (normal), "invisible" or "offline"
     pub login_mode: String,
     /// We set this account to invisible earlier and should restore it.
@@ -75,6 +78,8 @@ pub struct Status {
     pub steam_path: String,
     pub steam_running: bool,
     pub active_user: String,
+    /// OBS is running: the UI turns on streamer mode automatically
+    pub obs_running: bool,
 }
 
 fn now() -> u64 {
@@ -289,6 +294,7 @@ async fn get_status() -> Status {
             steam_path: String::new(),
             steam_running: false,
             active_user: String::new(),
+            obs_running: false,
         })
 }
 
@@ -299,6 +305,8 @@ fn status_impl() -> Status {
         steam_path: sp.map(|p| p.display().to_string()).unwrap_or_default(),
         steam_running: is_running("steam.exe"),
         active_user: active_account_name(),
+        // shortcut: only OBS Studio is detected; add XSplit etc. if someone asks
+        obs_running: is_running("obs64.exe"),
     }
 }
 
@@ -763,6 +771,17 @@ fn update_account(edit: AccountEdit) -> Result<(), String> {
                 "invisible" | "offline" => v,
                 _ => String::new(),
             };
+        }
+        Ok(())
+    })
+}
+
+/// Save a manual order: `ids` is the full list in the new order.
+#[tauri::command]
+fn reorder(ids: Vec<String>) -> Result<(), String> {
+    modify_store(|store| {
+        for a in store.iter_mut() {
+            a.sort_order = ids.iter().position(|i| *i == a.steamid).map(|p| p as u32 + 1).unwrap_or(0);
         }
         Ok(())
     })
@@ -1245,6 +1264,7 @@ pub fn run() {
             check_update,
             install_update,
             list_games,
+            reorder,
             refresh_tray,
             get_autostart,
             set_autostart,
