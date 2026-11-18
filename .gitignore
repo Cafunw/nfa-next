@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# local tooling
+.claude/
+.vscode/
+.idea/
+
+# never commit account data or tokens
+accounts.json
+*.vdf
+
+# OS
+Thumbs.db
+.DS_Store
