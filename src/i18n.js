@@ -86,6 +86,9 @@ const I18N = {
     backup: "Yedek", backupSub: "Takma ad, not, etiket ve ayarlar (token'lar hariç)",
     export: "Dışa aktar", import: "İçe aktar", exported: "Yedek kaydedildi", imported: "Yedek yüklendi: {a} yeni, {u} güncellendi",
     // v1.2
+    mShortcut: "Masaüstü kısayolu oluştur", shortcutMade: "Masaüstüne kısayol eklendi", mDeepLink: "nfa:// bağlantısını kopyala", deepLinkCopied: "Bağlantı kopyalandı",
+    protocol: "nfa:// bağlantıları", protocolSub: "Tarayıcı, Stream Deck ya da scriptlerden nfa://switch/<SteamID> ile geçiş",
+    protocolOn: "nfa:// bağlantıları açıldı", protocolOff: "nfa:// bağlantıları kapatıldı",
     sortCustom: "Kendi sıram (sürükle-bırak)", viewToggle: "Kart / liste görünümü",
     palPh: "Hesap ya da komut ara…", palHint: "<kbd>↑</kbd><kbd>↓</kbd> seç · <kbd>Enter</kbd> geç · <kbd>Shift Enter</kbd> görünmez geç · <kbd>Esc</kbd> kapat",
     paletteView: "Kart / liste görünümünü değiştir", paletteStreamer: "Yayıncı modunu aç / kapat",
@@ -185,6 +188,9 @@ const I18N = {
     backup: "Backup", backupSub: "Nicknames, notes, tags and settings (no tokens)",
     export: "Export", import: "Import", exported: "Backup saved", imported: "Backup loaded: {a} new, {u} updated",
     // v1.2
+    mShortcut: "Create desktop shortcut", shortcutMade: "Shortcut added to the desktop", mDeepLink: "Copy nfa:// link", deepLinkCopied: "Link copied",
+    protocol: "nfa:// links", protocolSub: "Switch from a browser, Stream Deck or scripts with nfa://switch/<SteamID>",
+    protocolOn: "nfa:// links turned on", protocolOff: "nfa:// links turned off",
     sortCustom: "My order (drag & drop)", viewToggle: "Card / list view",
     palPh: "Search accounts or commands…", palHint: "<kbd>↑</kbd><kbd>↓</kbd> select · <kbd>Enter</kbd> switch · <kbd>Shift Enter</kbd> switch invisible · <kbd>Esc</kbd> close",
     paletteView: "Toggle card / list view", paletteStreamer: "Toggle streamer mode",

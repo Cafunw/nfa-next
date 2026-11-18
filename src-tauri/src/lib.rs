@@ -615,6 +615,122 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+// ---------- command line, nfa:// links, desktop shortcuts ----------
+
+/// `--switch <id|login|nickname> [--mode invisible|offline]` or `nfa://switch/<id>?mode=invisible`.
+fn parse_action(args: &[String]) -> Option<(String, Option<String>)> {
+    let mode_ok = |m: &str| matches!(m, "invisible" | "offline" | "normal");
+    if let Some(link) = args.iter().find(|a| a.to_ascii_lowercase().starts_with("nfa://")) {
+        let rest = &link["nfa://".len()..];
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let target = path.trim_matches('/').strip_prefix("switch/")?.trim_matches('/').to_string();
+        let mode = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("mode="))
+            .filter(|m| mode_ok(m))
+            .map(|m| m.to_string());
+        return (!target.is_empty()).then_some((target, mode));
+    }
+    let i = args.iter().position(|a| a == "--switch")?;
+    let target = args.get(i + 1)?.clone();
+    let mode = args
+        .iter()
+        .position(|a| a == "--mode")
+        .and_then(|j| args.get(j + 1))
+        .filter(|m| mode_ok(m))
+        .cloned();
+    Some((target, mode))
+}
+
+/// SteamID64, login name or nickname -> SteamID64.
+fn resolve_target(target: &str) -> Option<String> {
+    let t = target.to_lowercase();
+    load_store()
+        .into_iter()
+        .find(|a| a.steamid == target || a.account_name.to_lowercase() == t || (!a.nickname.is_empty() && a.nickname.to_lowercase() == t))
+        .map(|a| a.steamid)
+}
+
+#[derive(Clone, Serialize)]
+struct CliSwitch {
+    steamid: String,
+    mode: Option<String>,
+}
+
+/// "normal" on the command line means "ignore the saved mode".
+fn cli_mode(m: Option<String>) -> Option<String> {
+    m.map(|m| if m == "normal" { String::new() } else { m })
+}
+
+/// A second launch (shortcut, link) while we're running: hand it to the open window.
+fn on_second_instance(app: &AppHandle, args: Vec<String>) {
+    use tauri::Emitter;
+    show_main(app);
+    if let Some((target, mode)) = parse_action(&args) {
+        if let Some(steamid) = resolve_target(&target) {
+            let _ = app.emit("cli-switch", CliSwitch { steamid, mode: cli_mode(mode) });
+        }
+    }
+}
+
+const PROTOCOL_KEY: &str = r"Software\Classes\nfa";
+
+#[tauri::command]
+fn get_protocol() -> bool {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(format!(r"{PROTOCOL_KEY}\shell\open\command"))
+        .and_then(|k| k.get_value::<String, _>(""))
+        .map(|v| v.contains(&exe))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_protocol(enabled: bool) -> Result<(), String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if !enabled {
+        let _ = hkcu.delete_subkey_all(PROTOCOL_KEY);
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+    let e = |e: std::io::Error| e.to_string();
+    let (root, _) = hkcu.create_subkey(PROTOCOL_KEY).map_err(e)?;
+    root.set_value("", &"URL:NFA Next").map_err(e)?;
+    root.set_value("URL Protocol", &"").map_err(e)?;
+    let (icon, _) = root.create_subkey("DefaultIcon").map_err(e)?;
+    icon.set_value("", &format!("\"{exe}\",0")).map_err(e)?;
+    let (c, _) = root.create_subkey(r"shell\open\command").map_err(e)?;
+    c.set_value("", &format!("\"{exe}\" \"%1\"")).map_err(e)
+}
+
+/// Desktop shortcut that switches to this account (runs `nfa-next.exe --switch <id>`).
+#[tauri::command]
+fn create_shortcut(steamid: String) -> Result<String, String> {
+    let acc = load_store().into_iter().find(|a| a.steamid == steamid).ok_or("Account not found.")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let desktop = dirs::desktop_dir().ok_or("Desktop folder not found.")?;
+    let safe: String = display_name(&acc)
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    let lnk = desktop.join(format!("{} - NFA Next.lnk", safe.trim()));
+    // values go through env vars, so names with quotes can't break the script
+    let script = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:NFA_LNK);\
+        $s.TargetPath=$env:NFA_EXE;$s.Arguments=$env:NFA_ARGS;$s.IconLocation=$env:NFA_EXE+',0';\
+        $s.Description='NFA Next';$s.Save()";
+    let out = cmd("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("NFA_LNK", &lnk)
+        .env("NFA_EXE", &exe)
+        .env("NFA_ARGS", format!("--switch {steamid}"))
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() || !lnk.exists() {
+        return Err(format!("Could not create the shortcut: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(lnk.display().to_string())
+}
+
 // ---------- autostart (Task Scheduler, so the admin app starts without a UAC prompt) ----------
 
 const TASK_NAME: &str = "NFA Next";
@@ -1234,17 +1350,32 @@ fn display_name(a: &Account) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // must be first: a second launch forwards its args here and exits
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| on_second_instance(app, args)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             use tauri::Manager;
             build_tray(app.handle())?;
+            let args: Vec<String> = std::env::args().collect();
             // started by the logon task: stay in the tray
-            if std::env::args().any(|a| a == "--minimized") {
+            if args.iter().any(|a| a == "--minimized") {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.hide();
                 }
+            }
+            // started by a shortcut / link: switch without showing the window, then quit
+            if let Some(steamid) = parse_action(&args).and_then(|(t, m)| resolve_target(&t).map(|id| (id, m))) {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let (id, mode) = steamid;
+                    let _ = switch_impl(id, cli_mode(mode));
+                    handle.exit(0);
+                });
             }
             Ok(())
         })
@@ -1265,6 +1396,9 @@ pub fn run() {
             install_update,
             list_games,
             reorder,
+            get_protocol,
+            set_protocol,
+            create_shortcut,
             refresh_tray,
             get_autostart,
             set_autostart,
@@ -1318,6 +1452,24 @@ mod tests {
         assert_eq!(steamid_from_token(tok).as_deref(), Some("76561198000000001"));
         assert_eq!(steamid_from_token("not.a.token"), None);
         assert_eq!(steamid_from_token("garbage"), None);
+    }
+
+    #[test]
+    fn cli_actions() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_action(&v(&["nfa.exe", "--switch", "alice"])), Some(("alice".into(), None)));
+        assert_eq!(
+            parse_action(&v(&["nfa.exe", "--switch", "76561198000000001", "--mode", "invisible"])),
+            Some(("76561198000000001".into(), Some("invisible".into())))
+        );
+        assert_eq!(
+            parse_action(&v(&["nfa.exe", "nfa://switch/76561198000000001/?mode=offline"])),
+            Some(("76561198000000001".into(), Some("offline".into())))
+        );
+        assert_eq!(parse_action(&v(&["nfa.exe", "nfa://switch/bob?mode=evil"])), Some(("bob".into(), None)));
+        assert_eq!(parse_action(&v(&["nfa.exe", "nfa://other/x"])), None);
+        assert_eq!(parse_action(&v(&["nfa.exe", "--minimized"])), None);
+        assert_eq!(cli_mode(Some("normal".into())), Some(String::new()));
     }
 
     #[test]

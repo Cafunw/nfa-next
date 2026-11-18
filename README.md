@@ -24,6 +24,12 @@
 
 - **One-click switching** — closes Steam cleanly, sets auto-login, starts Steam signed in as the chosen account.
 - **Invisible or offline sign-in** — per account, or one-off from the right-click menu.
+- **Live status** — see which account is online or in which game, from the public profile (no API key).
+- **Tray quick-switch** — switch from the notification area; close to tray, start with Windows.
+- **Launch a game after switching** — pick an installed game and its launch options per account.
+- **Command palette** — `Ctrl+K`, type a name, `Enter` (or `Shift+Enter` for invisible).
+- **Streamer mode** — blurs names, IDs, notes and photos; can turn on automatically with OBS.
+- **Shortcuts & links** — a desktop shortcut per account, `nfa://switch/<SteamID>` links for Stream Deck or scripts, and a command line.
 - **Real profile photos** — from Steam's own avatar cache, refreshed from the public profile.
 - **Ban badges** — VAC ban, trade ban, limited account and private profile at a glance, read from the public Steam profile (no API key).
 - **Cooldown timers** — set "ends in 2 h" or an exact date on an account and watch the countdown on its card; you get a notice when it ends.
@@ -32,8 +38,9 @@
 - **Encrypted tokens** — tokens are stored with Windows DPAPI, so only your Windows account on this PC can read them.
 - **Backup / restore** — export nicknames, notes, tags, colors, cooldowns and sign-in modes to a JSON file and load them on another PC.
 - **Auto-update** — installed copies find, verify (signed) and install new releases.
-- **Organize** — nicknames, notes, tags (Main, Smurf, Prime, …), colors and favorites; filter by tag, cooldown or ban.
-- **Keyboard first** — `1`–`9` quick switch, `Ctrl+F` search, `Ctrl+R` refresh, `Enter` / double-click to switch.
+- **Organize** — nicknames, notes, tags (Main, Smurf, Prime, …), colors and favorites; filter by tag, cooldown or ban; drag & drop your own order; card or list view.
+- **Make it yours** — accent color, interface size, reduce motion, searchable settings.
+- **Keyboard first** — `Ctrl+K` palette, `1`–`9` quick switch, `Ctrl+F` search, `Ctrl+R` refresh, `Enter` / double-click to switch.
 - **English & Turkish** — picks your system language, switchable in Settings.
 
 ## Install
@@ -61,6 +68,15 @@ When you switch, NFA Next:
 
 NFA Next keeps its own list in `%APPDATA%\nfa-next\accounts.json` and downloaded profile photos in `%APPDATA%\nfa-next\avatars\`.
 
+### Command line and links
+
+```
+nfa-next.exe --switch <SteamID64 | login name | nickname> [--mode invisible|offline|normal]
+nfa://switch/<SteamID64>?mode=invisible
+```
+
+Started this way, NFA Next switches and quits without showing its window; if it is already running, the open window does the switch. `nfa://` links work after turning on **Settings → nfa:// links**. Because the app runs as administrator, each shortcut or link launch shows the Windows admin prompt unless NFA Next is already running.
+
 ### Why administrator?
 
 The app asks for elevation on launch so it can reliably stop Steam and write Steam's config files. Steam itself is always started with normal user rights.
@@ -68,7 +84,7 @@ The app asks for elevation on launch so it can reliably stop Steam and write Ste
 ## Privacy
 
 - No telemetry, no accounts, no third-party servers.
-- **Online profile info** (on by default, can be turned off in Settings) requests `steamcommunity.com/profiles/<SteamID>?xml=1` for each account at most every 6 hours, and downloads the profile photo from Steam's image servers.
+- **Online profile info** (on by default, can be turned off in Settings) requests `steamcommunity.com/profiles/<SteamID>?xml=1` for each account every 3 minutes while the app runs (for the live status), and downloads the profile photo from Steam's image servers at most every 6 hours.
 - **Update check** (can be turned off in Settings) downloads `latest.json` from this repository's releases. Updates are verified against the public key in `tauri.conf.json` before installing.
 - Backups never contain tokens.
 
@@ -141,7 +157,7 @@ NFA Next is an independent project and is not affiliated with, endorsed by, or c
 2. **Steam'den yakala** butonuna bas; hesapların listeye gelir.
 3. Bir karta tıkla, ya da `1`–`9` tuşlarıyla hızlıca geç. Sağ tıkla **görünmez** ya da **çevrimdışı** geçebilirsin.
 
-**Özellikler:** gerçek profil fotoğrafları; VAC / takas yasağı, kısıtlı hesap ve gizli profil rozetleri; bekleme süresi geri sayımı; görünmez ve çevrimdışı giriş; Windows şifrelemesiyle (DPAPI) saklanan token'lar; yedekle / geri yükle; otomatik güncelleme; takma ad, not, etiket, renk ve favori; arama ve filtreleme; klavye kısayolları; Türkçe / İngilizce arayüz.
+**Özellikler:** canlı durum (çevrimiçi / oyunda); tepsi menüsünden hızlı geçiş ve Windows ile başlatma; geçişten sonra oyun başlatma; `Ctrl+K` komut paleti; yayıncı modu; masaüstü kısayolu ve `nfa://` bağlantıları; sürükle-bırak sıralama ve liste görünümü; vurgu rengi ve arayüz boyutu; gerçek profil fotoğrafları; VAC / takas yasağı, kısıtlı hesap ve gizli profil rozetleri; bekleme süresi geri sayımı; görünmez ve çevrimdışı giriş; Windows şifrelemesiyle (DPAPI) saklanan token'lar; yedekle / geri yükle; otomatik güncelleme; takma ad, not, etiket, renk ve favori; arama ve filtreleme; klavye kısayolları; Türkçe / İngilizce arayüz.
 
 **Gizlilik:** Telemetri yok. Uygulama yalnızca iki yere bağlanır, ikisi de Ayarlar'dan kapatılabilir: profil fotoğrafı ve ban durumu için `steamcommunity.com`, yeni sürüm kontrolü için bu deponun GitHub sürümleri. Hesap listen `%APPDATA%\nfa-next\accounts.json` dosyasında durur; yedek dosyalarına token'lar girmez.
 

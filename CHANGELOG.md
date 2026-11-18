@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+### New
+- **Live status** on every card: online, offline or "In game: Counter-Strike 2", from the public profile (no API key), refreshed every 3 minutes.
+- **Tray icon** with a quick-switch menu. Optional: close to tray, hide after switching.
+- **Start with Windows** in the tray, without an admin prompt (uses a logon task).
+- **Launch a game after switching**, picked from your installed games, with launch options.
+- **Command palette** (`Ctrl+K`): search accounts and commands; `Shift+Enter` switches invisible.
+- **Streamer mode**: blurs names, SteamIDs, notes and photos. Can turn on by itself while OBS Studio runs.
+- **Drag & drop ordering** with a new "My order" sort.
+- **List view** for many accounts.
+- **Accent color**, **interface size** (90–125%) and **reduce motion** settings.
+- **Settings search** and grouped settings.
+- **Desktop shortcuts** per account, **`nfa://switch/<SteamID>` links** and a **command line** (`--switch <id|login|nickname> [--mode invisible|offline|normal]`).
+- Copy profile link and friend code.
+
 ## 1.1.0
 
 ### New

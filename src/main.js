@@ -522,6 +522,7 @@ function settingsModal() {
       ${row("closeToTray", "closeToTraySub", toggle("sTray", closeToTray()))}
       ${row("hideAfterSwitch", "hideAfterSwitchSub", toggle("sHide", store.get("hideAfterSwitch") === "1"))}
       ${row("autostart", "autostartSub", toggle("sBoot", false))}
+      ${row("protocol", "protocolSub", toggle("sProto", false))}
       <h3 class="set-h">Steam</h3>
       ${row("startSteam", "startSteamSub", `<button class="btn ghost" id="sOpen">${esc(t("start"))}</button>`)}
       ${row("stopSteam", "stopSteamSub", `<button class="btn ghost" id="sStop">${esc(t("stop"))}</button>`)}
@@ -571,6 +572,12 @@ function settingsModal() {
     m.querySelector("#sAuto").onchange = (e) => store.set("autoCapture", e.target.checked ? "1" : "0");
     m.querySelector("#sTray").onchange = (e) => store.set("closeToTray", e.target.checked ? "1" : "0");
     m.querySelector("#sHide").onchange = (e) => store.set("hideAfterSwitch", e.target.checked ? "1" : "0");
+    const proto = m.querySelector("#sProto");
+    invoke("get_protocol").then((on) => (proto.checked = on)).catch(() => {});
+    proto.onchange = async () => {
+      try { await invoke("set_protocol", { enabled: proto.checked }); toast(t(proto.checked ? "protocolOn" : "protocolOff")); }
+      catch (e) { proto.checked = !proto.checked; toast(String(e), "err"); }
+    };
     const boot = m.querySelector("#sBoot");
     invoke("get_autostart").then((on) => (boot.checked = on)).catch(() => {});
     boot.onchange = async () => {
@@ -606,6 +613,9 @@ function openMenu(a, x, y) {
     <button data-m="copyLink">${ICON.copy} ${esc(t("mCopyLink"))}</button>
     <button data-m="copyCode">${ICON.copy} ${esc(t("mCopyCode"))}</button>
     <button data-m="profile">${ICON.link} ${esc(t("mProfile"))}</button>
+    <hr/>
+    <button data-m="shortcut">${ICON.bolt} ${esc(t("mShortcut"))}</button>
+    <button data-m="deeplink">${ICON.copy} ${esc(t("mDeepLink"))}</button>
     <hr/><button data-m="remove" class="danger">${ICON.trash} ${esc(t("remove"))}</button>`;
   menu.hidden = false;
   const r = menu.getBoundingClientRect();
@@ -625,6 +635,8 @@ function openMenu(a, x, y) {
       copyLink: () => copy(`https://steamcommunity.com/profiles/${a.steamid}`, t("copiedLink")),
       copyCode: () => copy(String(BigInt(a.steamid) - 76561197960265728n), t("copiedCode")),
       profile: () => invoke("plugin:opener|open_url", { url: `https://steamcommunity.com/profiles/${a.steamid}` }).catch((e) => toast(String(e), "err")),
+      shortcut: () => invoke("create_shortcut", { steamid: a.steamid }).then(() => toast(t("shortcutMade")), (e) => toast(String(e), "err")),
+      deeplink: () => copy(`nfa://switch/${a.steamid}`, t("deepLinkCopied")),
       remove: () => removeModal(a),
     })[m]();
   };
@@ -736,6 +748,8 @@ $("#winMin").onclick = () => appWin.minimize();
 $("#winMax").onclick = () => appWin.toggleMaximize();
 $("#winClose").onclick = () => (closeToTray() ? appWin.hide() : appWin.close());
 T.event.listen("tray-switch", (e) => switchTo(e.payload));
+// a shortcut / nfa:// link opened while the app was already running
+T.event.listen("cli-switch", (e) => switchTo(e.payload.steamid, e.payload.mode ?? undefined));
 appWin.onResized(async () => $("#app").classList.toggle("maximized", await appWin.isMaximized()));
 
 document.addEventListener("keydown", (e) => {
