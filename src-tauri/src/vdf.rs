@@ -23,6 +23,10 @@ impl Vdf {
     pub fn get(&self, key: &str) -> Option<&Vdf> {
         self.obj()?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
+    /// Like `get`, ignoring case (Steam is inconsistent: "Software", "steam").
+    pub fn get_ci(&self, key: &str) -> Option<&Vdf> {
+        self.obj()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
+    }
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Vdf> {
         self.obj_mut()?
             .iter_mut()

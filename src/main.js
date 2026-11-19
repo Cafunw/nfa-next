@@ -136,6 +136,35 @@ async function update(steamid, patch) {
     render();
   } catch (e) { toast(String(e), "err"); }
 }
+// Which accounts will Steam sign in without a password? Local files only, no switching.
+async function checkLogins() {
+  const btn = $("#btnCheck");
+  btn.disabled = true;
+  try {
+    state.accounts = await invoke("check_logins");
+    checkModal(state.accounts);
+  } catch (e) { toast(String(e), "err"); }
+  btn.disabled = false;
+}
+function checkModal(list) {
+  const need = list.filter((a) => a.login_state === "password").length;
+  const why = { not_remembered: "pwNotRemembered", no_saved_login: "pwNoSaved", expired: "pwExpired", not_in_steam: "pwNotInSteam" };
+  const rows = list.map((a) => {
+    const s = a.login_state;
+    const chip = s === "ok" ? `<span class="badge ok">${ICON.check} ${esc(t("signedIn"))}</span>`
+      : s === "password" ? `<span class="badge warn">${ICON.info} ${esc(t("needsPassword"))}</span>`
+      : `<span class="badge dim">${esc(t("chkUnknown"))}</span>`;
+    const sub = s === "ok" ? t("chkValidUntil", { d: a.login_expires ? new Date(a.login_expires * 1000).toLocaleDateString(locale()) : "?" })
+      : s === "password" ? t(why[a.login_reason] || "pwNoSaved") : t("pwUnreadable");
+    return `<div class="chk-row"><div class="chk-who"><b>${esc(shownName(a))}</b><small>@${esc(a.account_name)}</small></div><div class="chk-st">${chip}<small>${esc(sub)}</small></div></div>`;
+  }).join("");
+  openModal(`
+    <h2>${esc(t("checkLogins"))}</h2>
+    <p class="sub">${esc(need ? t("checkNeedN", { n: need }) : t("checkAllOk"))}</p>
+    <div class="chk-list">${rows}</div>
+    <p class="hint" style="margin-top:12px">${esc(t("checkLimit"))}</p>
+    <div class="modal-actions"><button class="btn ghost" data-close>${esc(t("closeBtn"))}</button></div>`);
+}
 let refreshing = false, avatarsFetched = false;
 async function refreshProfiles(force = false) {
   if (!onlineLookups() || !state.accounts.length || refreshing) return;
@@ -675,6 +704,7 @@ $("#btnAddToken").onclick = tokenModal;
 $("#emptyToken").onclick = tokenModal;
 $("#btnSettings").onclick = settingsModal;
 $("#btnView").onclick = toggleView;
+$("#btnCheck").onclick = checkLogins;
 
 // ---------- drag & drop reorder ----------
 let dragId = null;
@@ -712,7 +742,7 @@ let palSel = 0, palItems = [];
 function paletteItems(q) {
   q = q.trim().toLocaleLowerCase(locale());
   const acc = visibleAccounts(true).map((a) => ({ a, label: nameOf(a), sub: "@" + a.account_name, run: (shift) => switchTo(a.steamid, shift ? "invisible" : undefined) }));
-  const cmds = [["capture", () => capture()], ["addToken", tokenModal], ["settings", settingsModal], ["paletteView", toggleView], ["paletteStreamer", toggleStreamer]]
+  const cmds = [["capture", () => capture()], ["checkLogins", checkLogins], ["addToken", tokenModal], ["settings", settingsModal], ["paletteView", toggleView], ["paletteStreamer", toggleStreamer]]
     .map(([k, run]) => ({ label: t(k), sub: "", run }));
   const hay = (i) => [i.label, i.sub, ...(i.a ? [i.a.steamid, i.a.persona, i.a.note, ...i.a.tags] : [])].join(" ").toLocaleLowerCase(locale());
   return [...acc, ...cmds].filter((i) => !q || hay(i).includes(q));
@@ -750,7 +780,6 @@ $("#winClose").onclick = () => (closeToTray() ? appWin.hide() : appWin.close());
 T.event.listen("tray-switch", (e) => switchTo(e.payload));
 // a shortcut / nfa:// link opened while the app was already running
 T.event.listen("cli-switch", (e) => switchTo(e.payload.steamid, e.payload.mode ?? undefined));
-appWin.onResized(async () => $("#app").classList.toggle("maximized", await appWin.isMaximized()));
 
 document.addEventListener("keydown", (e) => {
   const typing = e.target.closest?.("input,textarea,select");

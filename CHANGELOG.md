@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2
+
+### New
+- **Sign-in check**: the key button (or `Ctrl+K`) lists every account and tells you which ones Steam will ask a password for, with the reason: not remembered, no saved sign-in, or expired. Nothing is switched and nothing runs on its own.
+
+### Fixed
+- Square gaps around the window corners. The window is no longer transparent; Windows 11 rounds the corners itself.
+
 ## 1.2.1
 
 ### Fixed

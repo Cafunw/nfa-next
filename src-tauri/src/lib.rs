@@ -70,6 +70,14 @@ pub struct Account {
     pub login_mode: String,
     /// We set this account to invisible earlier and should restore it.
     pub invisible_applied: bool,
+
+    /// result of the last sign-in check: "ok", "password" (Steam will ask) or "unknown"
+    pub login_state: String,
+    /// why: "not_remembered", "not_in_steam", "no_saved_login", "expired", "unreadable"
+    pub login_reason: String,
+    /// when Steam's saved sign-in runs out (unix seconds, 0 = unknown)
+    pub login_expires: u64,
+    pub login_checked: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,6 +353,104 @@ fn capture_accounts() -> Result<Vec<Account>, String> {
 #[tauri::command]
 fn list_accounts() -> Vec<Account> {
     for_ui(load_store())
+}
+
+// ---------- commands: sign-in check ----------
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        }
+    }
+    !c
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+fn jwt_exp(token: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_slice(&b64url_decode(token.split('.').nth(1)?)?).ok()?;
+    json.get("exp")?.as_u64()
+}
+
+/// Steam keeps each remembered sign-in in `%LOCALAPPDATA%\Steam\local.vdf` > ConnectCache,
+/// under "<crc32(account name) in hex, no padding>1": a DPAPI blob (hex) with the name as entropy.
+/// Ok(None) = nothing saved for this account. The token is only read in memory, never stored or shown.
+fn saved_login_token(name: &str) -> Result<Option<String>, String> {
+    let p = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("no LOCALAPPDATA")?)
+        .join("Steam")
+        .join("local.vdf");
+    if !p.exists() {
+        return Ok(None);
+    }
+    let root = vdf::parse(&fs::read_to_string(&p).map_err(|e| e.to_string())?)?;
+    let cache = ["MachineUserConfigStore", "Software", "Valve", "Steam", "ConnectCache"]
+        .iter()
+        .try_fold(&root, |v, k| v.get_ci(k));
+    let Some(cache) = cache else { return Ok(None) };
+    for n in [name.to_string(), name.to_lowercase()] {
+        let Some(blob) = cache.get_str(&format!("{:x}1", crc32(n.as_bytes()))) else { continue };
+        let plain = hex_decode(blob)
+            .and_then(|b| dpapi::crypt(&b, false, n.as_bytes()))
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or("could not decrypt Steam's saved sign-in")?;
+        return Ok(Some(plain));
+    }
+    Ok(None)
+}
+
+/// Will Steam sign this account in without a password? -> (state, reason, expires)
+fn check_login(name: &str, remembered: bool) -> (&'static str, &'static str, u64) {
+    if !remembered {
+        return ("password", "not_remembered", 0);
+    }
+    match saved_login_token(name) {
+        Err(_) => ("unknown", "unreadable", 0),
+        Ok(None) => ("password", "no_saved_login", 0),
+        Ok(Some(t)) => match jwt_exp(&t) {
+            None => ("unknown", "unreadable", 0),
+            Some(exp) if exp <= now() => ("password", "expired", exp),
+            Some(exp) => ("ok", "", exp),
+        },
+    }
+}
+
+/// Check every account without touching Steam or switching: reads loginusers.vdf and
+/// Steam's saved sign-ins. It cannot see a password change or "sign out everywhere" on Steam's side.
+#[tauri::command]
+async fn check_logins() -> Result<Vec<Account>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let users = read_loginusers()?;
+        let t = now();
+        let list = modify_store(|store| {
+            for a in store.iter_mut() {
+                let remembered = users
+                    .get("users")
+                    .and_then(|u| u.get(&a.steamid))
+                    .map(|e| e.get_str("RememberPassword") == Some("1"));
+                let (state, reason, exp) = match remembered {
+                    _ if a.account_name.is_empty() => ("unknown", "unreadable", 0),
+                    None => ("password", "not_in_steam", 0),
+                    Some(rem) => check_login(&a.account_name, rem),
+                };
+                a.login_state = state.into();
+                a.login_reason = reason.into();
+                a.login_expires = exp;
+                a.login_checked = t;
+            }
+            Ok(store.clone())
+        })?;
+        Ok(for_ui(list))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- commands: switching ----------
@@ -1383,6 +1489,7 @@ pub fn run() {
             get_status,
             capture_accounts,
             list_accounts,
+            check_logins,
             switch_account,
             add_account_token,
             update_account,
@@ -1505,6 +1612,23 @@ mod tests {
         let old: Account = serde_json::from_str(r#"{"steamid":"1","account_name":"x","token":"eyJ.old"}"#).unwrap();
         assert_eq!(old.token, "eyJ.old");
     }
+
+    #[test]
+    fn login_check_helpers() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926); // standard CRC-32 check value
+        assert_eq!(format!("{:x}1", 0x07E5_0BC2u32), "7e50bc21"); // key is not zero-padded
+        assert_eq!(hex_decode("01ff0a"), Some(vec![1, 255, 10]));
+        assert_eq!(hex_decode("0"), None);
+        assert_eq!(hex_decode("zz"), None);
+        // header.{"sub":"1","exp":1700000000}.sig
+        assert_eq!(jwt_exp("e30.eyJzdWIiOiIxIiwiZXhwIjoxNzAwMDAwMDAwfQ.x"), Some(1_700_000_000));
+        assert_eq!(jwt_exp("not-a-jwt"), None);
+        // a blob made with the account name as entropy, the way Steam stores it
+        let blob = dpapi::crypt(b"tok", true, b"alice").unwrap();
+        assert_eq!(dpapi::crypt(&blob, false, b"alice").as_deref(), Some(&b"tok"[..]));
+        assert!(dpapi::crypt(&blob, false, b"bob").is_none());
+        assert_eq!(check_login("x", false), ("password", "not_remembered", 0));
+    }
 }
 
 #[cfg(test)]
@@ -1564,6 +1688,14 @@ mod live_checks {
   ours: {}
   len {} vs {}", mask(&x), mask(&y), x.len(), y.len());
             }
+        }
+        // sign-in check: print only states, never names or tokens
+        let users = read_loginusers().unwrap();
+        for (i, a) in store.iter().enumerate() {
+            let rem = users.get("users").and_then(|u| u.get(&a.steamid)).and_then(|e| e.get_str("RememberPassword")) == Some("1");
+            let (s, r, exp) = check_login(&a.account_name, rem);
+            let days = (exp as i64 - now() as i64) / 86400;
+            println!("login check #{i}: remembered={rem} -> {s} {r} (expires in {days} days)");
         }
         if let Some(a) = store.first() {
             let info = profile::fetch_profile(&a.steamid).expect("profile fetch");

@@ -24,6 +24,7 @@
 
 - **One-click switching** — closes Steam cleanly, sets auto-login, starts Steam signed in as the chosen account.
 - **Invisible or offline sign-in** — per account, or one-off from the right-click menu.
+- **Sign-in check** — one button lists which accounts Steam will ask a password for, without switching. It reads Steam's own files on your PC. It can't see a password change or "sign out everywhere" on Steam's side.
 - **Live status** — see which account is online or in which game, from the public profile (no API key).
 - **Tray quick-switch** — switch from the notification area; close to tray, start with Windows.
 - **Launch a game after switching** — pick an installed game and its launch options per account.
